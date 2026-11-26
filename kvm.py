@@ -20,6 +20,8 @@ import traceback
 
 DEFAULT_PORT = 24801
 MARGIN = 4          # px from the edge where the cursor reappears when control returns
+ENTRY_INSET = 6     # px inside a client's edge where the cursor appears (so jitter can't bounce it back)
+SETTLE = 0.12       # seconds after taking control during which input is ignored (cursor-warp artefacts)
 DEBUG = False
 
 
@@ -199,6 +201,8 @@ class Controller:
         self.cooldown = 0.0
         self._dbg = 0
         self._dbg_t = 0.0
+        self.settle_until = 0.0
+        self._after = 0
 
     # -- peers
     def add_peer(self, peer):
@@ -209,6 +213,7 @@ class Controller:
             del self.peers[peer.name]
         if self.active is peer:
             self.active = None
+            self.be.freeze(False)
             log('active client %s disconnected - control back on this machine' % peer.name)
 
     def describe(self):
@@ -238,38 +243,45 @@ class Controller:
     def _enter(self, peer, side=None, frac=0.5):
         """Start controlling `peer`; the cursor appears on `side` of its screen, `frac` along it."""
         w, h = self.be.size()
+        from_server = self.active is None
         if self.active is not None and self.active is not peer:
             self.active.put({'t': 'leave'})
         mx, my = peer.w - 1, peer.h - 1
+        i = ENTRY_INSET
         if side == 'left':
-            self.vx, self.vy = 0, frac * my
+            self.vx, self.vy = i, frac * my
         elif side == 'right':
-            self.vx, self.vy = mx, frac * my
+            self.vx, self.vy = mx - i, frac * my
         elif side == 'top':
-            self.vx, self.vy = frac * mx, 0
+            self.vx, self.vy = frac * mx, i
         elif side == 'bottom':
-            self.vx, self.vy = frac * mx, my
+            self.vx, self.vy = frac * mx, my - i
         else:
             self.vx, self.vy = peer.w // 2, peer.h // 2
         self.vx, self.vy = int(self.vx), int(self.vy)
         self.active = peer
+        if from_server:
+            self.be.freeze(True)                  # stop the real cursor following the mouse
+            self.settle_until = time.time() + SETTLE
+        self._after = 0
         self.be.warp(w // 2, h // 2)          # park the real cursor in the middle
         peer.put({'t': 'move', 'x': self.vx, 'y': self.vy})
         log('-> controlling', peer.name)
 
-    def _leave(self, pos=None):
+    def _leave(self, pos=None, why=''):
         peer, self.active = self.active, None
         if peer is None:
             return
         peer.put({'t': 'leave'})
+        self.be.freeze(False)
         if pos:
             self.be.warp(*pos)
         self.cooldown = time.time() + 0.4
-        log('<- control back on this machine')
+        log('<- control back on this machine' + (' (%s)' % why if why else ''))
 
     def _hotkey_switch(self, n):
         if n == 0:
-            self._leave()
+            self._leave(why='hotkey')
         elif n <= len(self.layout.order):
             peer = self.peers.get(self.layout.order[n - 1])
             if peer and peer is not self.active:
@@ -295,6 +307,13 @@ class Controller:
                 self._enter(peer, OPPOSITE[edge], min(max(frac, 0), 1))
                 return True
             return False
+        if time.time() < self.settle_until:
+            if DEBUG:
+                log('ignored settling delta (%d,%d)' % (dx, dy))
+            return True
+        if DEBUG and self._after < 8:
+            self._after += 1
+            log('delta after taking control: (%d,%d)' % (dx, dy))
         self.vx += dx
         self.vy += dy
         mx, my = max(p.w - 1, 1), max(p.h - 1, 1)
@@ -315,7 +334,8 @@ class Controller:
                     pos = (w - 1 - MARGIN if edge == 'left' else MARGIN, int(frac * (h - 1)))
                 else:
                     pos = (int(frac * (w - 1)), h - 1 - MARGIN if edge == 'top' else MARGIN)
-                self._leave(pos)
+                self._leave(pos, 'moved off the %s edge of %s: delta (%d,%d), position (%d,%d)'
+                            % (edge, p.name, dx, dy, self.vx, self.vy))
                 return True
             if target and target in self.peers:
                 self._enter(self.peers[target], OPPOSITE[edge], frac)
@@ -644,6 +664,9 @@ class WinBackend:
         self.ax, self.ay = x, y
         self.u.SetCursorPos(int(x), int(y))
 
+    def freeze(self, on):
+        pass
+
     def cursor_pos(self):
         pt = self.wt.POINT()
         self.u.GetCursorPos(self.ct.byref(pt))
@@ -809,6 +832,7 @@ class MacBackend:
         cg.CGEventGetIntegerValueField.argtypes, cg.CGEventGetIntegerValueField.restype = [vp, u32], i64
         cg.CGEventGetLocation.argtypes, cg.CGEventGetLocation.restype = [vp], CGPoint
         cg.CGEventCreate.argtypes, cg.CGEventCreate.restype = [vp], vp
+        cg.CGAssociateMouseAndMouseCursorPosition.argtypes = [c.c_int32]
         cg.CGWarpMouseCursorPosition.argtypes = [CGPoint]
         cg.CGEventTapEnable.argtypes = [vp, c.c_bool]
         self.TAPCB = c.CFUNCTYPE(vp, vp, u32, vp, vp)
@@ -824,6 +848,8 @@ class MacBackend:
             cg.CGSetLocalEventsSuppressionInterval(0.0)   # no 0.25 s freeze after a warp
         except Exception:
             pass
+        import atexit
+        atexit.register(lambda: cg.CGAssociateMouseAndMouseCursorPosition(1))   # never leave it frozen
         self.pos = (0, 0)
         self.down_mods, self.held = set(), set()
         self.last_click = (0.0, None, (0, 0), 0)
@@ -835,6 +861,10 @@ class MacBackend:
 
     def warp(self, x, y):
         self.cg.CGWarpMouseCursorPosition(self.CGPoint(x, y))
+
+    def freeze(self, on):
+        """While controlling a client, detach the cursor from the mouse; deltas still arrive."""
+        self.cg.CGAssociateMouseAndMouseCursorPosition(0 if on else 1)
 
     def cursor_pos(self):
         ev = self.cg.CGEventCreate(None)

@@ -10,10 +10,15 @@ from unittest import mock
 import client
 import kvm
 
+kvm.SETTLE = 0          # most tests drive input instantly; one test restores the real value
+
 
 class FakeServerBackend:
     def __init__(self, w=1000, h=800):
-        self.w, self.h, self.warps = w, h, []
+        self.w, self.h, self.warps, self.freezes = w, h, [], []
+
+    def freeze(self, on):
+        self.freezes.append(on)
 
     def size(self):
         return self.w, self.h
@@ -78,9 +83,9 @@ class Tests(unittest.TestCase):
             self.assertTrue(r.ctl.on_move(999, 400, 3, 0))             # touches right edge -> captured
             self.assertIsNotNone(r.ctl.active)
             self.assertEqual(r.sb.warps[-1], (500, 400))               # real cursor parked mid-screen
-            self.assertTrue(wait_for(lambda: ('move', 0, 199) in r.cb.calls))   # enters client's left edge
+            self.assertTrue(wait_for(lambda: ('move', kvm.ENTRY_INSET, 199) in r.cb.calls))   # just inside client's left edge
             self.assertTrue(r.ctl.on_move(500, 400, 50, 10))
-            self.assertTrue(wait_for(lambda: ('move', 50, 209) in r.cb.calls))
+            self.assertTrue(wait_for(lambda: ('move', 56, 209) in r.cb.calls))
             self.assertTrue(r.ctl.on_button('l', True))
             self.assertTrue(r.ctl.on_wheel(0, 120))
             self.assertTrue(r.ctl.on_key('a', True))
@@ -94,6 +99,42 @@ class Tests(unittest.TestCase):
             # leaving released the held key and button on the client
             self.assertTrue(wait_for(lambda: ('key', 'a', 0) in r.cb.calls))
             self.assertIn(('btn', 'l', 0), r.cb.calls)
+        finally:
+            r.stop()
+
+    def test_entry_jitter_does_not_bounce_back(self):
+        r = Rig(['right:pc2'])
+        try:
+            self.assertTrue(wait_for(lambda: 'pc2' in r.ctl.peers))
+            r.ctl.on_move(999, 400, 3, 0)                              # enter pc2
+            r.ctl.on_move(500, 400, -3, 0)                             # small jitter toward the edge we came from
+            self.assertEqual(r.ctl.active.name, 'pc2')
+        finally:
+            r.stop()
+
+    def test_input_is_ignored_briefly_after_taking_control(self):
+        r = Rig(['right:pc2'])
+        try:
+            self.assertTrue(wait_for(lambda: 'pc2' in r.ctl.peers))
+            with mock.patch.object(kvm, 'SETTLE', 0.3):
+                r.ctl.on_move(999, 400, 3, 0)
+                start = r.ctl.vx
+                self.assertTrue(r.ctl.on_move(500, 400, -100, 0))      # a warp artefact: swallowed, not acted on
+                self.assertEqual((r.ctl.active.name, r.ctl.vx), ('pc2', start))
+                time.sleep(0.35)
+                r.ctl.on_move(500, 400, -100, 0)                       # same move after settling is real
+                self.assertIsNone(r.ctl.active)
+        finally:
+            r.stop()
+
+    def test_cursor_is_frozen_only_while_controlling_a_client(self):
+        r = Rig(['right:pc2'])
+        try:
+            self.assertTrue(wait_for(lambda: 'pc2' in r.ctl.peers))
+            r.ctl.on_move(999, 400, 3, 0)
+            self.assertEqual(r.sb.freezes, [True])
+            r.ctl.on_move(500, 400, -100, 0)                           # leave
+            self.assertEqual(r.sb.freezes, [True, False])
         finally:
             r.stop()
 
@@ -285,10 +326,10 @@ class ChainTests(unittest.TestCase):
             self.assertEqual(ctl.active.name, 'a')
             self.assertTrue(ctl.on_move(0, 0, 600, 0))                   # off a's right edge -> b
             self.assertEqual(ctl.active.name, 'b')
-            self.assertTrue(wait_for(lambda: ('move', 0, 199) in be_b.calls))   # same height, left edge of b
+            self.assertTrue(wait_for(lambda: ('move', kvm.ENTRY_INSET, 199) in be_b.calls))   # same height, just inside b's left edge
             self.assertTrue(ctl.on_move(0, 0, -50, 0))                   # off b's left edge -> back to a
             self.assertEqual(ctl.active.name, 'a')
-            self.assertEqual(ctl.vx, 499)                                # lands on a's right edge
+            self.assertEqual(ctl.vx, 499 - kvm.ENTRY_INSET)              # lands just inside a's right edge
         finally:
             for c in clients:
                 c.running = False
@@ -300,7 +341,7 @@ class ChainTests(unittest.TestCase):
         try:
             ctl.on_move(999, 400, 3, 0)
             ctl.on_move(0, 0, 600, 0)                                    # now in b at x=0
-            ctl.on_move(0, 0, -5, 0)                                     # off b's left edge -> a
+            ctl.on_move(0, 0, -10, 0)                                    # off b's left edge -> a
             self.assertEqual(ctl.active.name, 'a')
             ctl.on_move(0, 0, -600, 0)                                   # off a's left edge -> server
             self.assertIsNone(ctl.active)
