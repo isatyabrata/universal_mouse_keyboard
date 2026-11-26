@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# third-party installers analysed during development - do not redistribute
+ShareMouseSetup.*
