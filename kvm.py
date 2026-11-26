@@ -128,16 +128,71 @@ class Wire:
         return json.loads(data)
 
 
-# ------------------------------------------------------------ server controller
+# ------------------------------------------------------------ layout + controller
+SERVER = 'server'                      # reserved name of the machine running the server
+DIRS = {'right': (1, 0), 'left': (-1, 0), 'bottom': (0, 1), 'top': (0, -1)}
+OPPOSITE = {'right': 'left', 'left': 'right', 'top': 'bottom', 'bottom': 'top'}
+MAX_CLIENTS = 9
+
+
+class Layout:
+    """Which grid cell every screen occupies. Moving the mouse off one screen's edge
+    crosses to the screen in the neighbouring cell. The server is always a member."""
+
+    def __init__(self):
+        self.pos = {SERVER: (0, 0)}
+        self.order = []                # client names; list position = hotkey number
+
+    def add(self, name, prefer=None):
+        if name in self.pos:
+            return
+        cells = set(self.pos.values())
+        sx, sy = self.pos[SERVER]
+        spots = []
+        if prefer in DIRS:
+            spots.append((sx + DIRS[prefer][0], sy + DIRS[prefer][1]))
+        for anchor in [SERVER] + self.order:
+            ax, ay = self.pos[anchor]
+            spots += [(ax + DIRS[d][0], ay + DIRS[d][1]) for d in ('right', 'left', 'top', 'bottom')]
+        self.pos[name] = next(c for c in spots if c not in cells)
+        self.order.append(name)
+
+    def set_positions(self, new):
+        """Replace all positions at once (from the layout editor)."""
+        try:
+            cells = {n: (int(c[0]), int(c[1])) for n, c in new.items()}
+        except (TypeError, ValueError, IndexError, AttributeError):
+            raise ValueError('bad positions')
+        if set(cells) != set(self.pos):
+            raise ValueError('screens do not match the current layout')
+        if len(set(cells.values())) != len(cells) or any(abs(v) > 100 for c in cells.values() for v in c):
+            raise ValueError('two screens in one spot, or out of range')
+        self.pos = cells
+
+    def to_json(self):
+        return {'pos': {n: list(c) for n, c in self.pos.items()}, 'order': list(self.order)}
+
+    @classmethod
+    def from_json(cls, d):
+        lay = cls()
+        try:
+            lay.pos = {n: (int(c[0]), int(c[1])) for n, c in d['pos'].items()}
+            lay.order = [n for n in d['order'] if n in lay.pos and n != SERVER]
+            if SERVER not in lay.pos or len(set(lay.pos.values())) != len(lay.pos):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            return cls()
+        return lay
+
+
 class Controller:
     """Decides what is local and what is forwarded. Called from the OS input hook."""
 
     def __init__(self, backend, layout):
         self.be = backend
-        self.layout = layout            # [(edge or None, client name)] - order = hotkey number
+        self.layout = layout
         self.peers = {}
-        self.active = None              # Peer currently receiving input, or None
-        self.edge = None                # server edge the active peer was entered from
+        self.active = None              # Peer currently receiving input, or None = this machine
         self.vx = self.vy = 0           # virtual cursor inside the active peer's screen
         self.mods = set()
         self.eaten = set()              # hotkey keys whose release we must also swallow
@@ -154,22 +209,35 @@ class Controller:
             self.active = None
             log('active client %s disconnected - control back on this machine' % peer.name)
 
+    def _neighbor(self, name, edge):
+        """Name of the connected screen next to `name` across `edge`, or None."""
+        if name not in self.layout.pos:
+            return None
+        x, y = self.layout.pos[name]
+        want = (x + DIRS[edge][0], y + DIRS[edge][1])
+        for n, c in list(self.layout.pos.items()):
+            if c == want and (n == SERVER or n in self.peers):
+                return n
+        return None
+
     # -- switching
-    def _enter(self, peer, edge, x=0, y=0):
+    def _enter(self, peer, side=None, frac=0.5):
+        """Start controlling `peer`; the cursor appears on `side` of its screen, `frac` along it."""
         w, h = self.be.size()
         if self.active is not None and self.active is not peer:
             self.active.put({'t': 'leave'})
-        self.edge = edge
-        if edge == 'right':
-            self.vx, self.vy = 0, y * (peer.h - 1) // max(h - 1, 1)
-        elif edge == 'left':
-            self.vx, self.vy = peer.w - 1, y * (peer.h - 1) // max(h - 1, 1)
-        elif edge == 'bottom':
-            self.vx, self.vy = x * (peer.w - 1) // max(w - 1, 1), 0
-        elif edge == 'top':
-            self.vx, self.vy = x * (peer.w - 1) // max(w - 1, 1), peer.h - 1
+        mx, my = peer.w - 1, peer.h - 1
+        if side == 'left':
+            self.vx, self.vy = 0, frac * my
+        elif side == 'right':
+            self.vx, self.vy = mx, frac * my
+        elif side == 'top':
+            self.vx, self.vy = frac * mx, 0
+        elif side == 'bottom':
+            self.vx, self.vy = frac * mx, my
         else:
             self.vx, self.vy = peer.w // 2, peer.h // 2
+        self.vx, self.vy = int(self.vx), int(self.vy)
         self.active = peer
         self.be.warp(w // 2, h // 2)          # park the real cursor in the middle
         peer.put({'t': 'move', 'x': self.vx, 'y': self.vy})
@@ -188,10 +256,10 @@ class Controller:
     def _hotkey_switch(self, n):
         if n == 0:
             self._leave()
-        elif n <= len(self.layout):
-            peer = self.peers.get(self.layout[n - 1][1])
+        elif n <= len(self.layout.order):
+            peer = self.peers.get(self.layout.order[n - 1])
             if peer and peer is not self.active:
-                self._enter(peer, None)
+                self._enter(peer)
 
     # -- events from the backend; each returns True to swallow the event locally
     def on_move(self, x, y, dx, dy):
@@ -202,29 +270,40 @@ class Controller:
                 return False
             edge = ('right' if x >= w - 2 else 'left' if x <= 1 else
                     'bottom' if y >= h - 2 else 'top' if y <= 1 else None)
-            target = next((n for e, n in self.layout if e == edge), None) if edge else None
-            peer = self.peers.get(target) if target else None
+            peer = self.peers.get(self._neighbor(SERVER, edge)) if edge else None
             if peer:
-                self._enter(peer, edge, x, y)
+                frac = x / max(w - 1, 1) if edge in ('top', 'bottom') else y / max(h - 1, 1)
+                self._enter(peer, OPPOSITE[edge], min(max(frac, 0), 1))
                 return True
             return False
         self.vx += dx
         self.vy += dy
-        e = self.edge
-        fy = int(min(max(self.vy, 0), p.h - 1) * (h - 1) / max(p.h - 1, 1))
-        fx = int(min(max(self.vx, 0), p.w - 1) * (w - 1) / max(p.w - 1, 1))
-        if e == 'right' and self.vx < 0:
-            self._leave((w - 1 - MARGIN, fy))
-        elif e == 'left' and self.vx > p.w - 1:
-            self._leave((MARGIN, fy))
-        elif e == 'bottom' and self.vy < 0:
-            self._leave((fx, h - 1 - MARGIN))
-        elif e == 'top' and self.vy > p.h - 1:
-            self._leave((fx, MARGIN))
-        else:
-            self.vx = min(max(self.vx, 0), p.w - 1)
-            self.vy = min(max(self.vy, 0), p.h - 1)
-            p.put({'t': 'move', 'x': int(self.vx), 'y': int(self.vy)})
+        mx, my = max(p.w - 1, 1), max(p.h - 1, 1)
+        edge = frac = None
+        if self.vx < 0:
+            edge, frac = 'left', self.vy / my
+        elif self.vx > p.w - 1:
+            edge, frac = 'right', self.vy / my
+        elif self.vy < 0:
+            edge, frac = 'top', self.vx / mx
+        elif self.vy > p.h - 1:
+            edge, frac = 'bottom', self.vx / mx
+        if edge:
+            frac = min(max(frac, 0), 1)
+            target = self._neighbor(p.name, edge)
+            if target == SERVER:
+                if edge in ('left', 'right'):
+                    pos = (w - 1 - MARGIN if edge == 'left' else MARGIN, int(frac * (h - 1)))
+                else:
+                    pos = (int(frac * (w - 1)), h - 1 - MARGIN if edge == 'top' else MARGIN)
+                self._leave(pos)
+                return True
+            if target and target in self.peers:
+                self._enter(self.peers[target], OPPOSITE[edge], frac)
+                return True
+        self.vx = min(max(self.vx, 0), p.w - 1)
+        self.vy = min(max(self.vy, 0), p.h - 1)
+        p.put({'t': 'move', 'x': int(self.vx), 'y': int(self.vy)})
         return True
 
     def on_button(self, b, down):
@@ -309,10 +388,13 @@ class Peer:
 
 
 class Server:
-    def __init__(self, backend, layout, port, key):
+    def __init__(self, backend, layout, port, key, auto=False, on_change=None):
+        """auto=True lets any client that knows the secret join; it is added to the layout
+        in the next free cell. on_change() is called whenever the layout changes."""
         self.ctl = Controller(backend, layout)
         self.be = backend
-        self.names = {n for _, n in layout}
+        self.layout = layout
+        self.auto, self.on_change = auto, on_change
         self.key = key
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -336,6 +418,25 @@ class Server:
                 return
             threading.Thread(target=self._serve_conn, args=(c, addr), daemon=True).start()
 
+    def _known(self, name):
+        return name != SERVER and name in self.layout.pos
+
+    def _enroll(self, name):
+        if not self.auto or name == SERVER or len(self.layout.order) >= MAX_CLIENTS:
+            return False
+        self.layout.add(name)
+        log('new client %s added (hotkey Ctrl+Alt+Shift+%d) - drag it into place in the layout editor'
+            % (name, len(self.layout.order)))
+        if self.on_change:
+            self.on_change()
+        return True
+
+    def update_positions(self, positions):
+        """Called by the layout editor. Raises ValueError on bad input."""
+        self.layout.set_positions(positions)
+        if self.on_change:
+            self.on_change()
+
     def _serve_conn(self, c, addr):
         peer = None
         try:
@@ -352,7 +453,7 @@ class Server:
             if m.get('t') != 'hello' or not hmac.compare_digest(bytes.fromhex(m['proof']), want):
                 wire.send({'t': 'error', 'msg': 'authentication failed'})
                 raise ConnectionError('authentication failed (wrong secret?)')
-            if name not in self.names:
+            if not self._known(name) and not self._enroll(name):
                 wire.send({'t': 'error', 'msg': 'unknown client name'})
                 raise ConnectionError('unknown client name %r' % name)
             wire.send({'t': 'welcome', 'proof': _hm(self.key, b'server', s_nonce, c_nonce).hex()})
@@ -809,14 +910,16 @@ def make_backend():
 
 
 def parse_layout(items):
-    layout = []
+    layout = Layout()
     for it in items:
         edge, _, name = it.rpartition(':')
         if edge not in ('', 'left', 'right', 'top', 'bottom'):
             sys.exit('bad --client %r: use [left|right|top|bottom:]NAME' % it)
-        layout.append((edge or None, name))
-    if len(layout) > 9:
-        sys.exit('at most 9 clients (hotkeys 1-9)')
+        if not name or name == SERVER:
+            sys.exit('bad client name %r' % name)
+        layout.add(name, edge or None)
+    if len(layout.order) > MAX_CLIENTS:
+        sys.exit('at most %d clients (hotkeys 1-9)' % MAX_CLIENTS)
     return layout
 
 
@@ -842,25 +945,83 @@ def main(argv=None):
     DEBUG = a.debug
     if not a.secret:
         sys.exit('set --secret or KVM_SECRET')
-    key = derive_key(a.secret)
-    be = make_backend()
+    if a.mode == 'server':
+        run_server(parse_layout(a.client), a.port, a.secret)
+    else:
+        run_client(a.server, a.port, a.name, a.secret, a.invert_scroll)
+
+
+def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None):
     try:
-        if a.mode == 'server':
-            layout = parse_layout(a.client)
-            srv = Server(be, layout, a.port, key)
-            srv.start()
-            log('server listening on port %d; screen %dx%d' % (srv.port, *be.size()))
-            for i, (e, n) in enumerate(layout, 1):
-                log('  client %-12s %s   hotkey Ctrl+Alt+Shift+%d' % (n, e or 'no edge', i))
-            log('  return to this machine: Ctrl+Alt+Shift+0 (or cross the edge back)')
-            while True:
-                time.sleep(1)
-        else:
-            Client(be, a.server, a.port, a.name, key, a.invert_scroll).run()
+        be = make_backend()
+        srv = Server(be, layout, port, derive_key(secret), auto, on_change)
+        srv.start()
+        log('server listening on port %d; screen %dx%d' % (srv.port, *be.size()))
+        for i, n in enumerate(layout.order, 1):
+            log('  client %-12s hotkey Ctrl+Alt+Shift+%d' % (n, i))
+        if on_ready:
+            on_ready(srv)
+        if auto:
+            log('  waiting for clients to connect...')
+        log('  return to this machine: Ctrl+Alt+Shift+0 (or cross the screen edge back)')
+        log('  press Ctrl+C here to stop')
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
     except OSError as e:
         sys.exit('error: %s' % e)
+
+
+def run_client(host, port, name, secret, invert_scroll=False):
+    try:
+        Client(make_backend(), host, port, name, derive_key(secret), invert_scroll).run()
+    except KeyboardInterrupt:
+        pass
+    except OSError as e:
+        sys.exit('error: %s' % e)
+
+
+# ------------------------------------------- helpers for server.py / client.py
+CONFIG_PATH = os.path.join(os.path.expanduser('~'), '.kvm_share.json')
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_section(name, value):
+    """Update just one section ('server' or 'client') so the two never overwrite each other."""
+    cfg = load_config()
+    cfg[name] = value
+    save_config(cfg)
+
+
+def save_config(cfg):
+    """Settings include the shared passphrase, so keep the file private to this user."""
+    try:
+        fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(cfg, f, indent=2)
+    except OSError as e:
+        log('could not save settings: %s' % e)
+
+
+def local_ip():
+    """Best guess at this machine's LAN address (no traffic is actually sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('10.255.255.255', 1))
+        return s.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return '<this machine\'s IP>'
 
 
 if __name__ == '__main__':
