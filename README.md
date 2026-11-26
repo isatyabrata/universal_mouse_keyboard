@@ -67,6 +67,21 @@ Settings live in `~/.kvm_share.json` (readable only by you on macOS/Linux).
 Advanced/manual mode without the editor: `python kvm.py server --secret S --client right:laptop
 --client left:desktop` and `python kvm.py client --server IP --name laptop --secret S`.
 
+## Troubleshooting: "connected but the mouse doesn't move"
+
+1. **Check which edge to use.** When a client connects, the server prints a line such as
+   `push the mouse off this screen's RIGHT edge to reach win-pc`. Use that edge (on the server's
+   main display), or drag the box elsewhere in the layout editor. When control switches, the
+   server logs `-> controlling win-pc`.
+2. **Can the client machine be controlled at all?** On the client run `python kvm.py selftest`.
+   It moves that machine's cursor three times and reports `OK`/`FAIL` for each.
+3. **See the traffic.** Run both sides with `--debug` (`python server.py --debug`,
+   `python client.py --debug`). The server logs where the pointer is near edges and what it
+   forwards; the client logs what it receives. Include both outputs in a bug report.
+4. A line starting `WARNING: Windows refused injected input` means Windows blocked the
+   injection (error 5 = access denied): use a normal, non-admin Command Prompt and check
+   security software.
+
 ## Behaviour and limits
 
 - Keys map by physical US-keyboard position; the Windows key acts as Command and Alt as

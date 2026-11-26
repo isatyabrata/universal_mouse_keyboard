@@ -197,6 +197,8 @@ class Controller:
         self.mods = set()
         self.eaten = set()              # hotkey keys whose release we must also swallow
         self.cooldown = 0.0
+        self._dbg = 0
+        self._dbg_t = 0.0
 
     # -- peers
     def add_peer(self, peer):
@@ -208,6 +210,18 @@ class Controller:
         if self.active is peer:
             self.active = None
             log('active client %s disconnected - control back on this machine' % peer.name)
+
+    def describe(self):
+        """Plain-English list of which edge of THIS screen leads where."""
+        lines = []
+        for edge in ('right', 'left', 'top', 'bottom'):
+            n = self._neighbor(SERVER, edge)
+            if n:
+                lines.append("push the mouse off this screen's %s edge to reach %s" % (edge.upper(), n))
+        if not lines:
+            lines.append('no connected computer is next to this screen yet - drag it beside the '
+                         'Server box in the layout editor (or use Ctrl+Alt+Shift+1)')
+        return lines
 
     def _neighbor(self, name, edge):
         """Name of the connected screen next to `name` across `edge`, or None."""
@@ -271,6 +285,11 @@ class Controller:
             edge = ('right' if x >= w - 2 else 'left' if x <= 1 else
                     'bottom' if y >= h - 2 else 'top' if y <= 1 else None)
             peer = self.peers.get(self._neighbor(SERVER, edge)) if edge else None
+            if DEBUG and time.time() - self._dbg_t > 0.5 and (
+                    x >= w - 40 or x <= 40 or y >= h - 40 or y <= 40):
+                self._dbg_t = time.time()
+                log('pointer (%d,%d) on %dx%d screen; edge=%s; computer there=%s'
+                    % (x, y, w, h, edge, self._neighbor(SERVER, edge) if edge else None))
             if peer:
                 frac = x / max(w - 1, 1) if edge in ('top', 'bottom') else y / max(h - 1, 1)
                 self._enter(peer, OPPOSITE[edge], min(max(frac, 0), 1))
@@ -303,6 +322,10 @@ class Controller:
                 return True
         self.vx = min(max(self.vx, 0), p.w - 1)
         self.vy = min(max(self.vy, 0), p.h - 1)
+        if DEBUG:
+            self._dbg += 1
+            if self._dbg % 50 == 1:
+                log('forwarding to %s: delta (%d,%d) -> position (%d,%d)' % (p.name, dx, dy, self.vx, self.vy))
         p.put({'t': 'move', 'x': int(self.vx), 'y': int(self.vy)})
         return True
 
@@ -466,6 +489,8 @@ class Server:
             self.ctl.add_peer(peer)
             threading.Thread(target=peer.writer, daemon=True).start()
             log('client %s connected from %s (%dx%d)' % (name, addr[0], peer.w, peer.h))
+            for line in self.ctl.describe():
+                log('  ' + line)
             while True:
                 wire.recv()          # clients send nothing; this just detects disconnects
         except (OSError, ConnectionError, ValueError, KeyError) as e:
@@ -485,6 +510,8 @@ class Client:
         self.invert = -1 if invert_scroll else 1
         self.keys, self.buttons = set(), set()
         self.running = True
+        self.n = 0
+        self.got_move = False
 
     def run(self):
         while self.running:
@@ -517,6 +544,7 @@ class Client:
             wire.key = _hm(self.key, b'session', s_nonce, c_nonce)
             s.settimeout(20)         # server pings every 5 s
             log('connected to %s:%d as %s' % (self.host, self.port, self.name))
+            self.got_move = False
             while True:
                 self.apply(wire.recv())
         finally:
@@ -524,7 +552,14 @@ class Client:
 
     def apply(self, m):
         t = m['t']
+        if DEBUG and t != 'ping':
+            self.n += 1
+            if t != 'move' or self.n <= 10 or self.n % 100 == 0:
+                log('recv', m)
         if t == 'move':
+            if not self.got_move:
+                self.got_move = True
+                log('the server is now sending input here (first mouse position %s,%s)' % (m['x'], m['y']))
             self.be.inject_move(int(m['x']), int(m['y']))
         elif t == 'btn':
             (self.buttons.add if m['d'] else self.buttons.discard)(m['b'])
@@ -609,6 +644,11 @@ class WinBackend:
         self.ax, self.ay = x, y
         self.u.SetCursorPos(int(x), int(y))
 
+    def cursor_pos(self):
+        pt = self.wt.POINT()
+        self.u.GetCursorPos(self.ct.byref(pt))
+        return pt.x, pt.y
+
     # ---- capture
     def start_capture(self, handler):
         self.h = handler
@@ -685,7 +725,13 @@ class WinBackend:
 
     # ---- inject
     def _send(self, inp):
-        self.u.SendInput(1, self.ct.byref(inp), self.ct.sizeof(self.INPUT))
+        if self.u.SendInput(1, self.ct.byref(inp), self.ct.sizeof(self.INPUT)) != 1:
+            err = self.ct.get_last_error()
+            if not getattr(self, '_warned', False):
+                self._warned = True
+                log('WARNING: Windows refused injected input (SendInput error %d%s). '
+                    'Try running from a normal (non-admin) Command Prompt, and check security software.'
+                    % (err, ' = access denied' if err == 5 else ''))
 
     def _mouse_input(self, flags, data=0, dx=0, dy=0):
         i = self.INPUT()
@@ -762,6 +808,7 @@ class MacBackend:
         cg.CGEventSetIntegerValueField.argtypes = [vp, u32, i64]
         cg.CGEventGetIntegerValueField.argtypes, cg.CGEventGetIntegerValueField.restype = [vp, u32], i64
         cg.CGEventGetLocation.argtypes, cg.CGEventGetLocation.restype = [vp], CGPoint
+        cg.CGEventCreate.argtypes, cg.CGEventCreate.restype = [vp], vp
         cg.CGWarpMouseCursorPosition.argtypes = [CGPoint]
         cg.CGEventTapEnable.argtypes = [vp, c.c_bool]
         self.TAPCB = c.CFUNCTYPE(vp, vp, u32, vp, vp)
@@ -788,6 +835,12 @@ class MacBackend:
 
     def warp(self, x, y):
         self.cg.CGWarpMouseCursorPosition(self.CGPoint(x, y))
+
+    def cursor_pos(self):
+        ev = self.cg.CGEventCreate(None)
+        p = self.cg.CGEventGetLocation(ev)
+        self.cf.CFRelease(ev)
+        return int(round(p.x)), int(round(p.y))
 
     # ---- capture
     def start_capture(self, handler):
@@ -909,6 +962,27 @@ def make_backend():
     sys.exit('kvm.py supports Windows and macOS only')
 
 
+def selftest():
+    """Move the local cursor with the injection code and read it back. Isolates 'can this
+    machine be controlled?' from networking. Run it on any machine that will be a client."""
+    be = make_backend()
+    w, h = be.size()
+    print('screen size seen by the script: %dx%d' % (w, h))
+    start = be.cursor_pos()
+    ok = True
+    for x, y in ((w // 4, h // 4), (w // 2, h // 2), (3 * w // 4, 3 * h // 4)):
+        be.inject_move(x, y)
+        time.sleep(0.3)
+        got = be.cursor_pos()
+        good = abs(got[0] - x) <= 3 and abs(got[1] - y) <= 3
+        ok = ok and good
+        print('  asked for %-12s cursor is at %-12s %s' % ((x, y), got, 'OK' if good else 'FAIL'))
+    be.inject_move(*start)
+    print('RESULT:', 'injection works - this machine can be controlled.' if ok else
+          'injection FAILED - the cursor did not follow. Send this output to the developer.')
+    return 0 if ok else 1
+
+
 def parse_layout(items):
     layout = Layout()
     for it in items:
@@ -941,8 +1015,11 @@ def main(argv=None):
     cp.add_argument('--server', required=True, help='IP or hostname of the server')
     cp.add_argument('--name', required=True, help='this client\'s name as listed on the server')
     cp.add_argument('--invert-scroll', action='store_true')
+    sub.add_parser('selftest', help='move the local cursor to check input injection works')
     a = ap.parse_args(argv)
-    DEBUG = a.debug
+    DEBUG = getattr(a, 'debug', False)
+    if a.mode == 'selftest':
+        sys.exit(selftest())
     if not a.secret:
         sys.exit('set --secret or KVM_SECRET')
     if a.mode == 'server':
