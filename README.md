@@ -86,7 +86,7 @@ Advanced/manual mode without the editor: `python kvm.py server --secret S --clie
 
 - Keys map by physical US-keyboard position; the Windows key acts as Command and Alt as
   Option. The characters typed follow the *receiving* machine's keyboard layout.
-- Only each machine's primary display is used. No clipboard or file transfer.
+- Only each machine's primary display is used. **No clipboard or file transfer yet**: copy/paste between computers does not work.
 - Windows cannot capture or control elevated (administrator) windows or the UAC prompt.
 - **Traffic is authenticated (HMAC-SHA256) but not encrypted.** Keystrokes, including
   passwords, cross the network readable. Without the passphrase nobody can connect or inject

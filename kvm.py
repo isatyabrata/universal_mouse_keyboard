@@ -833,6 +833,8 @@ class MacBackend:
         cg.CGEventGetLocation.argtypes, cg.CGEventGetLocation.restype = [vp], CGPoint
         cg.CGEventCreate.argtypes, cg.CGEventCreate.restype = [vp], vp
         cg.CGAssociateMouseAndMouseCursorPosition.argtypes = [c.c_int32]
+        cg.CGDisplayHideCursor.argtypes = [u32]
+        cg.CGDisplayShowCursor.argtypes = [u32]
         cg.CGWarpMouseCursorPosition.argtypes = [CGPoint]
         cg.CGEventTapEnable.argtypes = [vp, c.c_bool]
         self.TAPCB = c.CFUNCTYPE(vp, vp, u32, vp, vp)
@@ -849,7 +851,9 @@ class MacBackend:
         except Exception:
             pass
         import atexit
-        atexit.register(lambda: cg.CGAssociateMouseAndMouseCursorPosition(1))   # never leave it frozen
+        atexit.register(lambda: (cg.CGAssociateMouseAndMouseCursorPosition(1), self._hide(False)))  # never leave it frozen
+        self.hidden = False
+        self.park = None                    # while controlling a client: where the real cursor is held
         self.pos = (0, 0)
         self.down_mods, self.held = set(), set()
         self.last_click = (0.0, None, (0, 0), 0)
@@ -863,8 +867,40 @@ class MacBackend:
         self.cg.CGWarpMouseCursorPosition(self.CGPoint(x, y))
 
     def freeze(self, on):
-        """While controlling a client, detach the cursor from the mouse; deltas still arrive."""
-        self.cg.CGAssociateMouseAndMouseCursorPosition(0 if on else 1)
+        """While controlling a client: detach the cursor from the mouse (deltas still arrive),
+        hide it, and hold it at the centre. macOS ignores a dropped mouse-move for the cursor
+        itself, so each of these is a belt-and-braces layer."""
+        err = self.cg.CGAssociateMouseAndMouseCursorPosition(0 if on else 1)
+        if DEBUG:
+            log('mac cursor %s (CGAssociate returned %s)' % ('frozen' if on else 'released', err))
+        self.park = tuple(v // 2 for v in self.size()) if on else None
+        self._hide(on)
+
+    def _hide(self, on):
+        if on == self.hidden:
+            return
+        cf, cg, c = self.cf, self.cg, self.c
+        try:
+            if on:
+                # a background process may only hide the cursor with this connection property
+                cf.CFStringCreateWithCString.argtypes = [c.c_void_p, c.c_char_p, c.c_uint32]
+                cf.CFStringCreateWithCString.restype = c.c_void_p
+                key = cf.CFStringCreateWithCString(None, b'SetsCursorInBackground', 0x08000100)
+                true = c.c_void_p.in_dll(cf, 'kCFBooleanTrue')
+                cg.CGSDefaultConnectionForThread.restype = c.c_int
+                cid = cg.CGSDefaultConnectionForThread()
+                cg.CGSSetConnectionProperty.argtypes = [c.c_int, c.c_int, c.c_void_p, c.c_void_p]
+                cg.CGSSetConnectionProperty(cid, cid, key, true)
+                cg.CGDisplayHideCursor(cg.CGMainDisplayID())
+            else:
+                for _ in range(5):                    # hide/show are counted: undo until visible
+                    cg.CGDisplayShowCursor(cg.CGMainDisplayID())
+                    if cg.CGCursorIsVisible():
+                        break
+            self.hidden = on
+        except Exception as e:           # private API: if it is missing the cursor just stays visible
+            if DEBUG:
+                log('could not %s the cursor: %s' % ('hide' if on else 'show', e))
 
     def cursor_pos(self):
         ev = self.cg.CGEventCreate(None)
@@ -913,6 +949,8 @@ class MacBackend:
                 dx = cg.CGEventGetIntegerValueField(event, 4)
                 dy = cg.CGEventGetIntegerValueField(event, 5)
                 swallow = h.on_move(loc.x, loc.y, dx, dy)
+                if swallow and self.park and (int(loc.x), int(loc.y)) != self.park:
+                    self.warp(*self.park)            # dropping the event does not stop the cursor
             elif etype in (1, 2, 3, 4, 25, 26):
                 if etype in (1, 2):
                     b = 'l'
