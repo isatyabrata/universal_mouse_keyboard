@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import socket
 import struct
 import sys
@@ -20,6 +21,7 @@ import traceback
 
 DEFAULT_PORT = 24801
 MARGIN = 4          # px from the edge where the cursor reappears when control returns
+RETRY_DELAY = 2.0   # seconds between a client's reconnection attempts
 ENTRY_INSET = 6     # px inside a client's edge where the cursor appears (so jitter can't bounce it back)
 SETTLE = 0.12       # seconds after taking control during which input is ignored (cursor-warp artefacts)
 DEBUG = False
@@ -382,6 +384,177 @@ class Controller:
         return (m & {'lctrl', 'rctrl'}) and (m & {'lalt', 'ralt'}) and (m & {'lshift', 'rshift'})
 
 
+# ------------------------------------------------ discovery + one-time pairing
+# A new client finds the server by UDP broadcast, then the two run an X25519 key exchange.
+# Each side derives the same 6-digit code from the exchange; the person at the server checks
+# it matches the one on the new computer and approves. Only then is the passphrase sent,
+# encrypted under a key only those two ends know. A man in the middle would end up with
+# different codes on the two screens.
+DISCOVERY_PORT = DEFAULT_PORT + 2
+PAIR_TIMEOUT = 120
+_P25519 = 2 ** 255 - 19
+_BASE25519 = (9).to_bytes(32, 'little')
+
+
+def x25519(k, u):
+    """RFC 7748 scalar multiplication (pure Python; used for a handful of pairings only)."""
+    k = bytearray(k)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(k, 'little')
+    u = int.from_bytes(u, 'little') & ((1 << 255) - 1)
+    x1, x2, z2, x3, z3, swap = u, 1, 0, u, 1, 0
+    for t in reversed(range(255)):
+        kt = (k >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = kt
+        a = (x2 + z2) % _P25519
+        aa = a * a % _P25519
+        b = (x2 - z2) % _P25519
+        bb = b * b % _P25519
+        e = (aa - bb) % _P25519
+        c = (x3 + z3) % _P25519
+        d = (x3 - z3) % _P25519
+        da = d * a % _P25519
+        cb = c * b % _P25519
+        x3 = pow(da + cb, 2, _P25519)
+        z3 = x1 * pow(da - cb, 2, _P25519) % _P25519
+        x2 = aa * bb % _P25519
+        z2 = e * (aa + 121665 * e) % _P25519
+    if swap:
+        x2, x3, z2, z3 = x3, x2, z3, z2
+    return (x2 * pow(z2, _P25519 - 2, _P25519) % _P25519).to_bytes(32, 'little')
+
+
+def _pair_key(shared, a_pub, b_pub):
+    return hashlib.sha256(b'kvm-pair/v1' + shared + a_pub + b_pub).digest()
+
+
+def _pair_code(k):
+    return '%06d' % (int.from_bytes(_hm(k, b'code')[:8], 'big') % 1000000)
+
+
+def _pair_xor(k, data):
+    stream = b''.join(_hm(k, b'enc', struct.pack('!I', i)) for i in range(len(data) // 32 + 1))
+    return bytes(a ^ b for a, b in zip(data, stream))
+
+
+def request_pairing(host, port, name, show_code, wait=PAIR_TIMEOUT + 30):
+    """Client side. Calls show_code(code) once the exchange is done, then blocks until the
+    person at the server approves. Returns the passphrase; raises ConnectionError otherwise."""
+    s = socket.create_connection((host, port), timeout=5)
+    try:
+        wire = Wire(s, False)
+        wire.recv()                                   # the server's normal challenge; unused here
+        priv = os.urandom(32)
+        a_pub = x25519(priv, _BASE25519)
+        wire.send({'t': 'pair', 'name': name, 'pub': a_pub.hex()})
+        r = wire.recv()
+        if r.get('t') == 'error':
+            raise ConnectionError(r.get('msg'))
+        b_pub = bytes.fromhex(r['pub'])
+        shared = x25519(priv, b_pub)
+        if len(b_pub) != 32 or not any(shared):
+            raise ConnectionError('bad key from the server')
+        k = _pair_key(shared, a_pub, b_pub)
+        show_code(_pair_code(k))
+        s.settimeout(wait)
+        r = wire.recv()
+        if r.get('t') == 'error':
+            raise ConnectionError(r.get('msg'))
+        ct = bytes.fromhex(r['ct'])
+        if not hmac.compare_digest(bytes.fromhex(r['mac']), _hm(k, b'mac', ct)):
+            raise ConnectionError('pairing reply failed verification')
+        return _pair_xor(k, ct).decode()
+    finally:
+        s.close()
+
+
+def broadcast_addresses():
+    addrs = ['255.255.255.255']
+    try:
+        ips = socket.gethostbyname_ex(socket.gethostname())[2] + [local_ip()]
+    except OSError:
+        ips = [local_ip()]
+    for ip in ips:
+        parts = ip.split('.')
+        if len(parts) == 4 and parts[0] != '127' and all(p.isdigit() for p in parts):
+            b = '.'.join(parts[:3] + ['255'])
+            if b not in addrs:
+                addrs.append(b)
+    return addrs
+
+
+def discover(port=DISCOVERY_PORT, targets=None, timeout=3.0):
+    """Ask the local network 'is a server here?'. Returns [(ip, tcp_port, hostname), ...]."""
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    u.bind(('', 0))
+    msg = json.dumps({'t': 'kvm-discover'}).encode()
+    found = {}
+    end = time.time() + timeout
+    try:
+        while time.time() < end:
+            for t in (targets or broadcast_addresses()):
+                try:
+                    u.sendto(msg, (t, port))
+                except OSError:
+                    pass
+            u.settimeout(0.5)
+            try:
+                data, addr = u.recvfrom(1024)
+                r = json.loads(data)
+                if r.get('t') == 'kvm-here':
+                    found[addr[0]] = (addr[0], int(r['port']), str(r.get('name', '')))
+                    end = min(end, time.time() + 0.3)       # take a moment for any others, then go
+            except (socket.timeout, ValueError, KeyError):
+                pass
+    finally:
+        u.close()
+    return list(found.values())
+
+
+_stdin_q = queue.Queue()
+_stdin_state = {'started': False, 'eof': False}
+
+
+def _stdin_reader():
+    try:
+        for line in sys.stdin:
+            _stdin_q.put(line)
+    except Exception:
+        pass
+    _stdin_state['eof'] = True
+    _stdin_q.put('')
+
+
+def terminal_approver(name, ip, code, timeout=PAIR_TIMEOUT):
+    """Ask the person at the server's terminal whether to let a new computer in."""
+    if not _stdin_state['started']:
+        _stdin_state['started'] = True
+        threading.Thread(target=_stdin_reader, daemon=True).start()
+    while not _stdin_q.empty():
+        try:
+            _stdin_q.get_nowait()                     # drop anything typed earlier
+        except queue.Empty:
+            break
+    if _stdin_state['eof']:
+        return False
+    print('\n  >>> "%s" (%s) wants to join.' % (name, ip))
+    print('      Its screen shows the pairing code   %s' % code)
+    print('      Type y + Enter ONLY if that exact code is on its screen (%ds): ' % timeout,
+          end='', flush=True)
+    try:
+        line = _stdin_q.get(timeout=timeout)
+    except queue.Empty:
+        print('\n      timed out - not paired')
+        return False
+    return line.strip().lower() in ('y', 'yes')
+
+
 MAX_CLIP = 100000     # characters of text shared per copy
 CLIP_POLL = 0.4       # seconds between clipboard checks
 
@@ -489,7 +662,8 @@ class Peer:
 
 
 class Server:
-    def __init__(self, backend, layout, port, key, auto=False, on_change=None, clipboard=True):
+    def __init__(self, backend, layout, port, key, auto=False, on_change=None, clipboard=True,
+                 secret=None, approver=None, discovery_port=None):
         """auto=True lets any client that knows the secret join; it is added to the layout
         in the next free cell. on_change() is called whenever the layout changes."""
         self.ctl = Controller(backend, layout)
@@ -499,6 +673,18 @@ class Server:
         self.key = key
         self.clip = None
         self.clipboard = clipboard
+        self.secret, self.approver = secret, approver      # for one-time pairing
+        self._pairing = threading.Lock()
+        self.disc = None
+        if discovery_port is not None:
+            try:
+                self.disc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.disc.bind(('0.0.0.0', discovery_port))
+                self.disc.settimeout(1.0)
+                self.discovery_port = self.disc.getsockname()[1]
+            except OSError as e:
+                log('warning: cannot answer discovery requests (%s); clients must use the IP' % e)
+                self.disc = None
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(('0.0.0.0', port))
@@ -513,6 +699,58 @@ class Server:
             self.clip = ClipSync(self.be, self._broadcast_clip, lambda: self.running)
             self.clip.start()
         threading.Thread(target=self._accept_loop, daemon=True).start()
+        if self.disc:
+            threading.Thread(target=self._discovery_loop, daemon=True).start()
+
+    def _discovery_loop(self):
+        reply = json.dumps({'t': 'kvm-here', 'port': self.port, 'name': socket.gethostname()}).encode()
+        while self.running:
+            try:
+                data, addr = self.disc.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                if json.loads(data).get('t') == 'kvm-discover':
+                    self.disc.sendto(reply, addr)
+            except (ValueError, AttributeError, OSError):
+                pass
+
+    def _pair(self, wire, m, addr):
+        if not (self.approver and self.secret):
+            wire.send({'t': 'error', 'msg': 'pairing is not enabled on this server'})
+            return
+        if not self._pairing.acquire(False):
+            wire.send({'t': 'error', 'msg': 'another computer is pairing right now - try again'})
+            return
+        try:
+            name = str(m.get('name', ''))
+            a_pub = bytes.fromhex(m['pub'])
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', name) or len(a_pub) != 32:
+                wire.send({'t': 'error', 'msg': 'bad pairing request'})
+                return
+            priv = os.urandom(32)
+            b_pub = x25519(priv, _BASE25519)
+            shared = x25519(priv, a_pub)
+            if not any(shared):
+                wire.send({'t': 'error', 'msg': 'bad key'})
+                return
+            k = _pair_key(shared, a_pub, b_pub)
+            wire.send({'t': 'pair_pub', 'pub': b_pub.hex()})
+            try:
+                ok = self.approver(name, addr[0], _pair_code(k))
+            except Exception:
+                ok = False
+            if not ok:
+                wire.send({'t': 'error', 'msg': 'pairing was declined on the server'})
+                log('pairing with %s declined' % name)
+                return
+            ct = _pair_xor(k, self.secret.encode())
+            wire.send({'t': 'pair_ok', 'ct': ct.hex(), 'mac': _hm(k, b'mac', ct).hex()})
+            log('paired with %s (%s)' % (name, addr[0]))
+        finally:
+            self._pairing.release()
 
     def _broadcast_clip(self, text, skip=None):
         for p in list(self.ctl.peers.values()):
@@ -558,6 +796,8 @@ class Server:
             s_nonce = os.urandom(16)
             wire.send({'t': 'challenge', 'n': s_nonce.hex()})
             m = wire.recv()
+            if m.get('t') == 'pair':
+                return self._pair(wire, m, addr)
             name = str(m['name'])
             c_nonce = bytes.fromhex(m['n'])
             want = _hm(self.key, b'client', s_nonce, c_nonce, name.encode())
@@ -595,7 +835,10 @@ class Server:
 
 # ----------------------------------------------------------------------- client
 class Client:
-    def __init__(self, backend, host, port, name, key, invert_scroll=False, clipboard=True):
+    def __init__(self, backend, host, port, name, key, invert_scroll=False, clipboard=True,
+                 on_lost=None):
+        self.on_lost = on_lost          # called after repeated failures; may return a new (host, port)
+        self.connected = False
         self.be, self.host, self.port, self.name, self.key = backend, host, port, name, key
         self.invert = -1 if invert_scroll else 1
         self.keys, self.buttons = set(), set()
@@ -618,13 +861,21 @@ class Client:
     def run(self):
         if self.clip:
             self.clip.start()
+        fails = 0
         while self.running:
+            self.connected = False
             try:
                 self.session()
             except (OSError, ConnectionError, ValueError, KeyError) as e:
                 log('disconnected: %s' % e)
             self.release_all()
-            time.sleep(2)
+            fails = 0 if self.connected else fails + 1
+            if self.on_lost and fails and fails % 3 == 0:
+                new = self.on_lost()                  # -> (host, port) or None
+                if new and tuple(new) != (self.host, self.port):
+                    log('the server moved to %s:%d' % tuple(new))
+                    self.host, self.port = new
+            time.sleep(RETRY_DELAY)
 
     def session(self):
         s = socket.create_connection((self.host, self.port), timeout=5)
@@ -649,6 +900,7 @@ class Client:
             s.settimeout(20)         # server pings every 5 s
             log('connected to %s:%d as %s' % (self.host, self.port, self.name))
             self.got_move = False
+            self.connected = True
             self.wire = wire
             while True:
                 self.apply(wire.recv())
@@ -1009,6 +1261,7 @@ class MacBackend:
         import atexit
         atexit.register(lambda: (cg.CGAssociateMouseAndMouseCursorPosition(1), self._hide(False)))  # never leave it frozen
         self.hidden = False
+        self.drift, self.asserted = 0, 0.0
         self.park = None                    # while controlling a client: where the real cursor is held
         self.pos = (0, 0)
         self.down_mods, self.held = set(), set()
@@ -1027,10 +1280,34 @@ class MacBackend:
         hide it, and hold it at the centre. macOS ignores a dropped mouse-move for the cursor
         itself, so each of these is a belt-and-braces layer."""
         err = self.cg.CGAssociateMouseAndMouseCursorPosition(0 if on else 1)
-        if DEBUG:
-            log('mac cursor %s (CGAssociate returned %s)' % ('frozen' if on else 'released', err))
+        if on:
+            self.drift, self.asserted = 0, time.time()
         self.park = tuple(v // 2 for v in self.size()) if on else None
         self._hide(on)
+        if DEBUG:
+            log('mac cursor %s (CGAssociate returned %s, hidden=%s, visible per system=%s)'
+                % ('frozen' if on else 'released', err, self.hidden, bool(self.cg.CGCursorIsVisible())))
+        if not on and DEBUG and self.drift:
+            log('mac cursor drifted %d times while a client was controlled' % self.drift)
+
+    def _hold(self, loc):
+        """Called for every mouse event swallowed while controlling a client: keep the real
+        cursor parked, frozen and hidden, and say so in --debug if macOS fought back."""
+        pos = (int(loc.x), int(loc.y))
+        if pos != self.park:
+            self.drift += 1
+            if DEBUG and self.drift <= 5:
+                log('mac cursor drifted to %s while frozen (parked at %s) - warping it back' % (pos, self.park))
+            self.warp(*self.park)                # dropping the event does not stop the cursor
+        now = time.time()
+        if now - self.asserted > 0.25:           # re-assert in case the system undid it
+            self.asserted = now
+            self.cg.CGAssociateMouseAndMouseCursorPosition(0)
+            if self.cg.CGCursorIsVisible():
+                if DEBUG:
+                    log('mac cursor had become visible again - hiding it')
+                self.hidden = False
+                self._hide(True)
 
     def _hide(self, on):
         if on == self.hidden:
@@ -1119,8 +1396,8 @@ class MacBackend:
                 dx = cg.CGEventGetIntegerValueField(event, 4)
                 dy = cg.CGEventGetIntegerValueField(event, 5)
                 swallow = h.on_move(loc.x, loc.y, dx, dy)
-                if swallow and self.park and (int(loc.x), int(loc.y)) != self.park:
-                    self.warp(*self.park)            # dropping the event does not stop the cursor
+                if swallow and self.park:
+                    self._hold(loc)
             elif etype in (1, 2, 3, 4, 25, 26):
                 if etype in (1, 2):
                     b = 'l'
@@ -1267,10 +1544,14 @@ def main(argv=None):
         run_client(a.server, a.port, a.name, a.secret, a.invert_scroll, not a.no_clipboard)
 
 
-def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None, clipboard=True):
+def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None, clipboard=True,
+               pairing=False):
     try:
         be = make_backend()
-        srv = Server(be, layout, port, derive_key(secret), auto, on_change, clipboard)
+        srv = Server(be, layout, port, derive_key(secret), auto, on_change, clipboard,
+                     secret=secret if pairing else None,
+                     approver=terminal_approver if pairing else None,
+                     discovery_port=DISCOVERY_PORT if pairing else None)
         srv.start()
         log('server listening on port %d; screen %dx%d' % (srv.port, *be.size()))
         for i, n in enumerate(layout.order, 1):
@@ -1289,9 +1570,10 @@ def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None, 
         sys.exit('error: %s' % e)
 
 
-def run_client(host, port, name, secret, invert_scroll=False, clipboard=True):
+def run_client(host, port, name, secret, invert_scroll=False, clipboard=True, on_lost=None):
     try:
-        Client(make_backend(), host, port, name, derive_key(secret), invert_scroll, clipboard).run()
+        Client(make_backend(), host, port, name, derive_key(secret), invert_scroll, clipboard,
+               on_lost).run()
     except KeyboardInterrupt:
         pass
     except OSError as e:

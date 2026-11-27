@@ -20,22 +20,25 @@ cd universal_mouse_keyboard
 python server.py
 ```
 
-It asks nothing. It finds its own IP, creates a passphrase, and prints the exact command for
-the other computers, for example:
+Nothing to configure. It creates its own passphrase and opens the layout editor.
+
+**2. On every other computer:**
 
 ```
-python client.py 192.168.1.10 Xk3pQ9aB
+python client.py
 ```
 
-**2. On every other computer, run the command it printed** (from a clone of this repo):
+Use `python3` instead of `python` on a Mac. The client finds the server on your network by
+itself and shows a 6-digit **pairing code**. The server's window shows the same code and asks
+you to type `y` if it matches. That's a one-time approval per computer: the passphrase is then
+handed over privately (an X25519 key exchange; a man-in-the-middle would produce different
+codes on the two screens) and saved, so from then on a plain `python client.py` reconnects,
+and re-finds the server if its address changes. Each client is named after its hostname
+(`--name` to change). Start order doesn't matter; clients keep retrying.
 
-```
-python client.py 192.168.1.10 Xk3pQ9aB
-```
-
-Use `python3` instead of `python` on a Mac. Each client names itself after its hostname, shows
-up on the server automatically, and is remembered, so next time a plain `python client.py`
-(and a plain `python server.py`) is enough. Start order doesn't matter; clients keep retrying.
+If your network blocks discovery (some Wi-Fi isolates devices), give the server's IP, which
+`server.py` prints: `python client.py 192.168.1.10`. You can still skip pairing entirely with
+`python client.py 192.168.1.10 PASSPHRASE`. `python client.py --pair` pairs again.
 
 **3. Arrange the screens.** `server.py` opens a layout editor in your browser
 (`http://localhost:24802`). Each computer is a box; drag it to match how your desks are laid out.
@@ -57,7 +60,7 @@ instantly and are saved. Use `--no-browser` to skip auto-opening it.
 
 - **macOS** (server or client): System Settings > Privacy & Security > grant *Accessibility*
   and *Input Monitoring* to the terminal app you run it from, then restart that terminal.
-- **Windows** (server): allow `python.exe` inbound TCP **24801** on a private network
+- **Windows** (server): allow `python.exe` inbound TCP **24801** and UDP **24803** on a private network
   (accept the firewall prompt). Clients only make outgoing connections.
 - Clients must be able to reach the server's IP on that port (same network, no blocking firewall).
   If the printed IP isn't the right one for your network, substitute the correct one.
@@ -66,6 +69,7 @@ instantly and are saved. Use `--no-browser` to skip auto-opening it.
 
 `server.py`: `--reset` (new passphrase, forget the layout), `--port`, `--no-browser`, `--no-clipboard`, `--debug`.
 `client.py`: `--name NAME` (default: hostname), `--invert-scroll`, `--port`, `--no-clipboard`, `--debug`.
+Pairing needs UDP port 24803 reachable on the server (discovery) as well as TCP 24801.
 Settings live in `~/.kvm_share.json` (readable only by you on macOS/Linux).
 
 Advanced/manual mode without the editor: `python kvm.py server --secret S --client right:laptop

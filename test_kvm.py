@@ -11,6 +11,7 @@ from unittest import mock
 import client
 import kvm
 
+kvm.RETRY_DELAY = 0.05
 kvm.CLIP_POLL = 0.02    # poll the (fake) clipboards quickly
 kvm.SETTLE = 0          # most tests drive input instantly; one test restores the real value
 
@@ -537,6 +538,124 @@ class ClipboardTests(unittest.TestCase):
             self.assertEqual(s.recv(4096), b'')             # server hangs up
         finally:
             s.close()
+
+
+class PairingTests(unittest.TestCase):
+    def _server(self, approver, secret='pw'):
+        srv = kvm.Server(FakeServerBackend(), kvm.Layout(), 0, kvm.derive_key(secret), auto=True,
+                         secret=secret, approver=approver, discovery_port=0)
+        srv.start()
+        return srv
+
+    def test_x25519_rfc7748_vectors(self):
+        a = bytes.fromhex('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a')
+        b = bytes.fromhex('5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb')
+        pa, pb = kvm.x25519(a, kvm._BASE25519), kvm.x25519(b, kvm._BASE25519)
+        self.assertEqual(pa.hex(), '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a')
+        shared = '4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742'
+        self.assertEqual(kvm.x25519(a, pb).hex(), shared)
+        self.assertEqual(kvm.x25519(b, pa).hex(), shared)
+
+    def test_discovery_finds_the_server(self):
+        srv = self._server(lambda *a: True)
+        try:
+            found = kvm.discover(srv.discovery_port, ['127.0.0.1'], timeout=3)
+            self.assertEqual([(ip, port) for ip, port, _ in found], [('127.0.0.1', srv.port)])
+        finally:
+            srv.running = False
+
+    def test_discovery_finds_nothing_when_no_server(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(('127.0.0.1', 0))                     # a port nobody answers on
+        try:
+            self.assertEqual(kvm.discover(s.getsockname()[1], ['127.0.0.1'], timeout=0.6), [])
+        finally:
+            s.close()
+
+    def test_approved_pairing_hands_over_the_secret_and_codes_match(self):
+        seen = {}
+        srv = self._server(lambda name, ip, code: seen.update(name=name, ip=ip, code=code) or True,
+                           secret='Xk3pQ9aB-long-and-\u00e9')
+        try:
+            shown = []
+            secret = kvm.request_pairing('127.0.0.1', srv.port, 'win-pc', shown.append, wait=5)
+            self.assertEqual(secret, 'Xk3pQ9aB-long-and-\u00e9')
+            self.assertEqual(shown, [seen['code']])
+            self.assertEqual((seen['name'], seen['ip']), ('win-pc', '127.0.0.1'))
+            self.assertRegex(seen['code'], r'^\d{6}$')
+            # and the handed-over secret really lets the client in
+            cli, be = _join(srv, 'win-pc', secret)
+            self.assertTrue(wait_for(lambda: 'win-pc' in srv.ctl.peers))
+        finally:
+            srv.running = False
+
+    def test_declined_pairing_reveals_nothing(self):
+        srv = self._server(lambda *a: False)
+        try:
+            with self.assertRaises(ConnectionError) as cm:
+                kvm.request_pairing('127.0.0.1', srv.port, 'win-pc', lambda c: None, wait=5)
+            self.assertIn('declined', str(cm.exception))
+        finally:
+            srv.running = False
+
+    def test_pairing_disabled_without_approver(self):
+        srv = kvm.Server(FakeServerBackend(), kvm.Layout(), 0, kvm.derive_key('pw'), auto=True)
+        srv.start()
+        try:
+            with self.assertRaises(ConnectionError):
+                kvm.request_pairing('127.0.0.1', srv.port, 'win-pc', lambda c: None, wait=5)
+        finally:
+            srv.running = False
+
+    def test_only_one_pairing_at_a_time(self):
+        gate = threading.Event()
+        srv = self._server(lambda *a: gate.wait(5) or True)
+        try:
+            first = []
+            t = threading.Thread(target=lambda: first.append(
+                kvm.request_pairing('127.0.0.1', srv.port, 'a', lambda c: None, wait=8)))
+            t.start()
+            time.sleep(0.5)
+            with self.assertRaises(ConnectionError) as cm:
+                kvm.request_pairing('127.0.0.1', srv.port, 'b', lambda c: None, wait=5)
+            self.assertIn('another', str(cm.exception))
+            gate.set()
+            t.join(5)
+            self.assertEqual(first, ['pw'])
+        finally:
+            gate.set()
+            srv.running = False
+
+    def test_bad_names_and_keys_are_rejected(self):
+        srv = self._server(lambda *a: True)
+        try:
+            with self.assertRaises(ConnectionError):
+                kvm.request_pairing('127.0.0.1', srv.port, 'bad name!', lambda c: None, wait=5)
+        finally:
+            srv.running = False
+
+    def test_client_refinds_a_moved_server(self):
+        srv = self._server(lambda *a: True)
+        be = FakeClientBackend()
+        real, calls = socket.create_connection, []
+
+        def flaky(addr, *a, **kw):
+            calls.append(addr[0])
+            if addr[0] == '10.9.9.9':                 # the server's old address: nothing there
+                raise ConnectionRefusedError('no route')
+            return real(addr, *a, **kw)
+
+        cli = kvm.Client(be, '10.9.9.9', srv.port, 'pc9', kvm.derive_key('pw'),
+                         on_lost=lambda: ('127.0.0.1', srv.port))
+        try:
+            with mock.patch('kvm.socket.create_connection', flaky):
+                threading.Thread(target=cli.run, daemon=True).start()
+                self.assertTrue(wait_for(lambda: 'pc9' in srv.ctl.peers, 8))
+            self.assertEqual(cli.host, '127.0.0.1')
+            self.assertEqual(calls.count('10.9.9.9'), 3)      # gave up on the old address after 3 tries
+        finally:
+            cli.running = False
+            srv.running = False
 
 
 class MacClipboardTests(unittest.TestCase):

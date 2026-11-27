@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run this on the computer your keyboard and mouse are plugged into.
 
-No questions asked: it finds its own IP address, creates (and remembers) a passphrase,
-prints the one command to run on the other computers, and opens a drag-and-drop screen
-layout editor in your browser. Clients that connect appear in the editor automatically.
+Nothing to configure: it creates (and remembers) a passphrase and opens a drag-and-drop
+screen layout editor in your browser. On every other computer just run `python client.py`:
+it finds this server by itself, and you approve it once by checking a 6-digit code.
 
     python server.py            (python3 on a Mac)
 """
@@ -46,15 +46,18 @@ def main():
                 threading.Timer(0.5, webbrowser.open, (url,)).start()
 
     print('\n' + '=' * 64)
-    print('  Server ready. On every OTHER computer, run:\n')
-    print('      python client.py %s %s\n' % (kvm.local_ip(), s['secret']))
-    print('  (use python3 on a Mac)')
+    print('  Server ready (%s). On every OTHER computer, just run:\n' % kvm.local_ip())
+    print('      python client.py\n')
+    print('  (python3 on a Mac). It finds this server by itself and shows a 6-digit')
+    print('  code; this window then asks you to confirm the same code - type y.')
+    print('  That happens once per computer; after that it simply reconnects.')
     print('=' * 64)
+    print('If a network blocks discovery: python client.py %s   (still needs the y)' % kvm.local_ip())
     print('Each computer appears in the layout editor (opens in your browser) as it')
     print('connects - drag the boxes to match your desk. Ctrl+Alt+Shift+1..9 jumps to')
     print('a computer; Ctrl+Alt+Shift+0 always returns here.\n')
     kvm.run_server(layout, a.port, s['secret'], auto=True, on_change=save, on_ready=ready,
-                   clipboard=not a.no_clipboard)
+                   clipboard=not a.no_clipboard, pairing=True)
 
 
 if __name__ == '__main__':
