@@ -137,7 +137,7 @@ class Wire:
 SERVER = 'server'                      # reserved name of the machine running the server
 DIRS = {'right': (1, 0), 'left': (-1, 0), 'bottom': (0, 1), 'top': (0, -1)}
 OPPOSITE = {'right': 'left', 'left': 'right', 'top': 'bottom', 'bottom': 'top'}
-MAX_CLIENTS = 9
+MAX_CLIENTS = 64        # edge-crossing works for all of them; hotkeys 1-9 reach the first nine
 
 
 class Layout:
@@ -1263,7 +1263,7 @@ class MacBackend:
         self.hidden = False
         self.pumping = False
         self._calls = queue.SimpleQueue()
-        self.drift, self.asserted = 0, 0.0
+        self.drift, self.rehid = 0, 0
         self.park = None                    # while controlling a client: where the real cursor is held
         self.pos = (0, 0)
         self.down_mods, self.held = set(), set()
@@ -1283,7 +1283,7 @@ class MacBackend:
         itself, so each of these is a belt-and-braces layer."""
         self.park = tuple(v // 2 for v in self.size()) if on else None
         if on:
-            self.drift, self.asserted = 0, time.time()
+            self.drift = self.rehid = 0
         self._main(lambda: self._apply_freeze(on))
 
     # The cursor-hiding / association calls only take effect when made from the process's MAIN
@@ -1298,30 +1298,61 @@ class MacBackend:
     def pump(self, timeout=1.0):
         self.pumping = True
         try:
-            fn = self._calls.get(timeout=timeout)
+            fn = self._calls.get(timeout=0.1 if self.park else timeout)
         except queue.Empty:
-            return
+            if self.park:                        # controlling a client: keep the cursor frozen + hidden
+                fn = self._reassert
+            else:
+                return
         try:
             fn()
         except Exception:
             traceback.print_exc()
 
     def _apply_freeze(self, on):
+        if on:
+            self.warp(*self.park)                # leave whatever was under the cursor (Dock, menu bar...)
         err = self.cg.CGAssociateMouseAndMouseCursorPosition(0 if on else 1)
-        self._hide(on)
+        if on:
+            tries = self._conceal()
+        else:
+            self._hide(False)
+            tries = 0
         if DEBUG:
-            log('mac cursor %s (CGAssociate returned %s, hidden=%s, visible per system=%s)'
-                % ('frozen' if on else 'released', err, self.hidden, bool(self.cg.CGCursorIsVisible())))
+            log('mac cursor %s (CGAssociate returned %s; hidden=%s after %d tries)'
+                % ('frozen' if on else 'released', err, not self.cg.CGCursorIsVisible(), tries))
             if not on and self.drift:
                 log('mac cursor position drifted %d times while a client was controlled' % self.drift)
 
-    def _reassert(self):
-        self.cg.CGAssociateMouseAndMouseCursorPosition(0)
-        if self.cg.CGCursorIsVisible():
-            if DEBUG:
-                log('mac cursor had become visible again - hiding it')
+    def _conceal(self):
+        """Hide the cursor and check it took. Whatever was under the cursor when control switched
+        (the Dock, the menu bar, a window) can keep owning the cursor until the window server
+        sees a real mouse event at the new spot, so if it stays visible we post one harmless
+        move at the parking spot and try again."""
+        for tries in range(1, 7):
             self.hidden = False
             self._hide(True)
+            if not self.cg.CGCursorIsVisible():
+                return tries
+            self._nudge()
+            time.sleep(0.04)
+        return tries
+
+    def _nudge(self):
+        ev = self.cg.CGEventCreateMouseEvent(None, 5, self.CGPoint(*(self.park or self.pos)), 0)
+        self.cg.CGEventSetIntegerValueField(ev, 42, self.NUDGE)
+        self.cg.CGEventPost(0, ev)
+        self.cf.CFRelease(ev)
+
+    def _reassert(self):
+        if not self.park:
+            return
+        self.cg.CGAssociateMouseAndMouseCursorPosition(0)
+        if self.cg.CGCursorIsVisible():
+            self.rehid += 1
+            if DEBUG and self.rehid <= 3:
+                log('mac cursor became visible again - hiding it')
+            self._conceal()
 
     def _hold(self, loc):
         """Called for every mouse event swallowed while controlling a client: keep the real
@@ -1332,10 +1363,6 @@ class MacBackend:
             if DEBUG and self.drift <= 5:
                 log('mac cursor drifted to %s while frozen (parked at %s) - warping it back' % (pos, self.park))
             self.warp(*self.park)                # dropping the event does not stop the cursor
-        now = time.time()
-        if now - self.asserted > 0.25:           # re-assert in case the system undid it
-            self.asserted = now
-            self._main(self._reassert)
 
     def _hide(self, on):
         if on == self.hidden:
@@ -1412,11 +1439,15 @@ class MacBackend:
             raise OSError('cannot create the event tap - grant this terminal app Accessibility '
                           'and Input Monitoring in System Settings > Privacy & Security, then restart it')
 
+    NUDGE = 0x4B564D31      # tags the one mouse-move we post ourselves so our tap lets it through
+
     def _tap(self, proxy, etype, event, refcon):
         cg, h = self.cg, self.h
         try:
             if etype in (0xFFFFFFFE, 0xFFFFFFFF):          # tap disabled by timeout / user
                 cg.CGEventTapEnable(self.tap, True)
+                return event
+            if cg.CGEventGetIntegerValueField(event, 42) == self.NUDGE:
                 return event
             swallow = False
             if etype in (5, 6, 7, 27):
@@ -1536,7 +1567,7 @@ def parse_layout(items):
             sys.exit('bad client name %r' % name)
         layout.add(name, edge or None)
     if len(layout.order) > MAX_CLIENTS:
-        sys.exit('at most %d clients (hotkeys 1-9)' % MAX_CLIENTS)
+        sys.exit('at most %d clients' % MAX_CLIENTS)
     return layout
 
 
@@ -1554,7 +1585,7 @@ def main(argv=None):
     sp = sub.choices['server']
     sp.add_argument('--client', action='append', required=True, metavar='[EDGE:]NAME',
                     help='allowed client; EDGE is where its screen sits relative to this one. '
-                         'Order = hotkey number (Ctrl+Alt+Shift+1..9)')
+                         'Order = hotkey number (Ctrl+Alt+Shift+1..9 for the first nine)')
     cp = sub.choices['client']
     cp.add_argument('--server', required=True, help='IP or hostname of the server')
     cp.add_argument('--name', required=True, help='this client\'s name as listed on the server')

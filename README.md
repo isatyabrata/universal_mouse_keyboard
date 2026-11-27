@@ -50,7 +50,8 @@ instantly and are saved. Use `--no-browser` to skip auto-opening it.
 
 - **Ctrl+Alt+Shift+1..9** jumps straight to a computer (the number is shown on its box).
 - **Ctrl+Alt+Shift+0** always returns control to the server. This is your escape hatch.
-- Up to 9 clients.
+- Up to 64 clients. Edge-crossing works for all of them, on any side, including client to
+  client; the hotkeys cover the first nine.
 - **Clipboard:** copied *text* is shared between all connected computers automatically
   (the latest copy wins, up to 100,000 characters). Copy on one, paste on another. Use
   `--no-clipboard` on a machine to opt out of sending and receiving. Images and files are

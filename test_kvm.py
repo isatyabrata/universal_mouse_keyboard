@@ -684,11 +684,9 @@ class MacCursorTests(unittest.TestCase):
         def tap_thread():
             time.sleep(0.1)
             be.freeze(True)
-            time.sleep(0.4)
-            res['hidden'] = not be.cg.CGCursorIsVisible()
+            res['hidden'] = wait_for(lambda: not be.cg.CGCursorIsVisible(), 2)
             be.freeze(False)
-            time.sleep(0.4)
-            res['shown'] = bool(be.cg.CGCursorIsVisible())
+            res['shown'] = wait_for(lambda: bool(be.cg.CGCursorIsVisible()), 2)
             res['done'] = True
 
         threading.Thread(target=tap_thread, daemon=True).start()
@@ -697,6 +695,38 @@ class MacCursorTests(unittest.TestCase):
             be.pump(0.05)
         self.assertTrue(res.get('hidden'), 'cursor was not hidden')
         self.assertTrue(res.get('shown'), 'cursor was not restored')
+
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS only')
+    def test_our_nudge_passes_the_tap_but_other_moves_are_swallowed(self):
+        be = kvm.MacBackend()
+
+        class Swallow:
+            active = object()
+
+            def on_move(self, *a):
+                return True
+
+        be.h = Swallow()
+
+        def move(marked):
+            ev = be.cg.CGEventCreateMouseEvent(None, 5, be.CGPoint(10, 10), 0)
+            if marked:
+                be.cg.CGEventSetIntegerValueField(ev, 42, be.NUDGE)
+            return ev
+
+        self.assertIsNone(be._tap(None, 5, move(False), None))
+        self.assertIsNotNone(be._tap(None, 5, move(True), None))
+
+
+class LayoutScaleTests(unittest.TestCase):
+    def test_many_clients_and_any_side(self):
+        lay = kvm.Layout()
+        for i in range(40):
+            lay.add('pc%d' % i)
+        cells = set(lay.pos.values())
+        self.assertEqual(len(cells), 41)                  # 40 clients + the server, no two in one cell
+        self.assertGreaterEqual(kvm.MAX_CLIENTS, 40)
 
 
 if __name__ == '__main__':
