@@ -672,5 +672,32 @@ class MacClipboardTests(unittest.TestCase):
                 be.clip_set(saved)
 
 
+class MacCursorTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS only')
+    def test_freeze_from_the_tap_thread_really_hides_the_cursor(self):
+        """Regression: hiding from a non-main thread silently did nothing. freeze() must be
+        queued to the main thread (which run_server drives through pump())."""
+        be = kvm.MacBackend()
+        be.pumping = True
+        res = {}
+
+        def tap_thread():
+            time.sleep(0.1)
+            be.freeze(True)
+            time.sleep(0.4)
+            res['hidden'] = not be.cg.CGCursorIsVisible()
+            be.freeze(False)
+            time.sleep(0.4)
+            res['shown'] = bool(be.cg.CGCursorIsVisible())
+            res['done'] = True
+
+        threading.Thread(target=tap_thread, daemon=True).start()
+        end = time.time() + 5
+        while not res.get('done') and time.time() < end:
+            be.pump(0.05)
+        self.assertTrue(res.get('hidden'), 'cursor was not hidden')
+        self.assertTrue(res.get('shown'), 'cursor was not restored')
+
+
 if __name__ == '__main__':
     unittest.main()

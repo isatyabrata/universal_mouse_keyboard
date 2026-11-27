@@ -1261,6 +1261,8 @@ class MacBackend:
         import atexit
         atexit.register(lambda: (cg.CGAssociateMouseAndMouseCursorPosition(1), self._hide(False)))  # never leave it frozen
         self.hidden = False
+        self.pumping = False
+        self._calls = queue.SimpleQueue()
         self.drift, self.asserted = 0, 0.0
         self.park = None                    # while controlling a client: where the real cursor is held
         self.pos = (0, 0)
@@ -1279,16 +1281,47 @@ class MacBackend:
         """While controlling a client: detach the cursor from the mouse (deltas still arrive),
         hide it, and hold it at the centre. macOS ignores a dropped mouse-move for the cursor
         itself, so each of these is a belt-and-braces layer."""
-        err = self.cg.CGAssociateMouseAndMouseCursorPosition(0 if on else 1)
+        self.park = tuple(v // 2 for v in self.size()) if on else None
         if on:
             self.drift, self.asserted = 0, time.time()
-        self.park = tuple(v // 2 for v in self.size()) if on else None
+        self._main(lambda: self._apply_freeze(on))
+
+    # The cursor-hiding / association calls only take effect when made from the process's MAIN
+    # thread (from the event-tap thread they return success but do nothing, as the --debug log
+    # showed), so they are queued to the main loop, which run_server drives through pump().
+    def _main(self, fn):
+        if self.pumping:
+            self._calls.put(fn)
+        else:
+            fn()
+
+    def pump(self, timeout=1.0):
+        self.pumping = True
+        try:
+            fn = self._calls.get(timeout=timeout)
+        except queue.Empty:
+            return
+        try:
+            fn()
+        except Exception:
+            traceback.print_exc()
+
+    def _apply_freeze(self, on):
+        err = self.cg.CGAssociateMouseAndMouseCursorPosition(0 if on else 1)
         self._hide(on)
         if DEBUG:
             log('mac cursor %s (CGAssociate returned %s, hidden=%s, visible per system=%s)'
                 % ('frozen' if on else 'released', err, self.hidden, bool(self.cg.CGCursorIsVisible())))
-        if not on and DEBUG and self.drift:
-            log('mac cursor drifted %d times while a client was controlled' % self.drift)
+            if not on and self.drift:
+                log('mac cursor position drifted %d times while a client was controlled' % self.drift)
+
+    def _reassert(self):
+        self.cg.CGAssociateMouseAndMouseCursorPosition(0)
+        if self.cg.CGCursorIsVisible():
+            if DEBUG:
+                log('mac cursor had become visible again - hiding it')
+            self.hidden = False
+            self._hide(True)
 
     def _hold(self, loc):
         """Called for every mouse event swallowed while controlling a client: keep the real
@@ -1302,12 +1335,7 @@ class MacBackend:
         now = time.time()
         if now - self.asserted > 0.25:           # re-assert in case the system undid it
             self.asserted = now
-            self.cg.CGAssociateMouseAndMouseCursorPosition(0)
-            if self.cg.CGCursorIsVisible():
-                if DEBUG:
-                    log('mac cursor had become visible again - hiding it')
-                self.hidden = False
-                self._hide(True)
+            self._main(self._reassert)
 
     def _hide(self, on):
         if on == self.hidden:
@@ -1562,8 +1590,9 @@ def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None, 
             log('  waiting for clients to connect...')
         log('  return to this machine: Ctrl+Alt+Shift+0 (or cross the screen edge back)')
         log('  press Ctrl+C here to stop')
+        pump = getattr(be, 'pump', time.sleep)
         while True:
-            time.sleep(1)
+            pump(1.0)
     except KeyboardInterrupt:
         pass
     except OSError as e:
