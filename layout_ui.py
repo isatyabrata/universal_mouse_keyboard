@@ -4,6 +4,8 @@ Stdlib only. Listens on 127.0.0.1 and rejects foreign Host headers / cross-site 
 only a browser on the server machine itself can rearrange screens.
 """
 import json
+import os
+import urllib.parse
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -30,6 +32,7 @@ h1{font-size:20px;margin:0 0 4px}p{color:var(--mut);margin:0 0 16px}
 .screen.me{border-color:var(--ok)}
 .name{font-weight:600;font-size:16px}.sub{font-size:12px;color:var(--mut)}
 .row{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--mut)}
+.screen.drop{outline:3px solid var(--ok);background:var(--cell)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--line);margin-right:6px}
 .on .dot,.me .dot{background:var(--ok)}
 kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:11px}
@@ -40,7 +43,9 @@ kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:11px}
 screen next to it. Drop a screen on any dashed cell; changes apply instantly.</p>
 <div id="wrap"><div id="board"></div></div>
 <div id="msg"></div>
-<p style="margin-top:12px">Hotkeys: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>1&ndash;9</kbd> jumps to that
+<p style="margin-top:12px">Send files: drop them onto a connected computer's box. They arrive in that computer's
+Downloads &rsaquo; KVM Received folder. From another computer: <code>python send.py file</code>.</p>
+<p>Hotkeys: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>1&ndash;9</kbd> jumps to that
 computer, <kbd>0</kbd> returns to the server.</p>
 </main>
 <script>
@@ -57,7 +62,7 @@ function say(t,err){msg.textContent=t||'';msg.className=err?'err':''}
 async function load(){ try{ state=await api('/api/state'); render(); }catch(e){ say('Lost connection to the server: '+e.message,true);} }
 
 function render(){
-  if(drag) return;
+  if(drag||hover) return;
   const xs=state.nodes.map(n=>n.x), ys=state.nodes.map(n=>n.y);
   view={x0:Math.min(...xs)-1,x1:Math.max(...xs)+1,y0:Math.min(...ys)-1,y1:Math.max(...ys)+1};
   board.style.width=(view.x1-view.x0+1)*CW+'px'; board.style.height=(view.y1-view.y0+1)*CH+'px';
@@ -77,9 +82,31 @@ function render(){
     el.querySelector('.name').textContent=n.name==='server'?'Server':n.name;
     el.querySelector('.sub').textContent=size;
     el.addEventListener('pointerdown',e=>start(e,el,n));
+    if(n.connected&&!n.server) wireDrop(el,n);
     board.appendChild(el);
   }
 }
+let hover=0;
+function wireDrop(el,n){
+  const files=e=>e.dataTransfer&&Array.from(e.dataTransfer.types||[]).includes('Files');
+  el.addEventListener('dragover',e=>{ if(files(e)){ e.preventDefault(); el.classList.add('drop'); } });
+  el.addEventListener('dragenter',e=>{ if(files(e)){ hover++; el.classList.add('drop'); } });
+  el.addEventListener('dragleave',()=>{ hover=Math.max(0,hover-1); el.classList.remove('drop'); });
+  el.addEventListener('drop',async e=>{
+    e.preventDefault(); hover=0; el.classList.remove('drop');
+    for(const f of Array.from(e.dataTransfer.files)){
+      say('Sending '+f.name+' to '+n.name+'...');
+      try{
+        const r=await fetch('/api/send?to='+encodeURIComponent(n.name),{method:'POST',
+          headers:{'X-KVM':'1','X-Filename':encodeURIComponent(f.name)},body:f});
+        if(!r.ok) throw new Error((await r.text())||r.status);
+        say('Sent '+f.name+' to '+n.name+'.');
+      }catch(err){ say('Could not send '+f.name+': '+err.message,true); }
+    }
+  });
+}
+window.addEventListener('dragover',e=>e.preventDefault());
+window.addEventListener('drop',e=>e.preventDefault());
 function place(el,x,y){
   el.style.left=((x-view.x0)*CW+G/2)+'px'; el.style.top=((y-view.y0)*CH+G/2)+'px';
   el.style.width=(CW-G)+'px'; el.style.height=(CH-G)+'px';
@@ -146,9 +173,59 @@ def make_handler(srv):
                 return self._send(200, self._state())
             self._send(404, 'not found', 'text/plain')
 
+        def _reject(self, code, text):
+            """Answer an error without leaving the browser stuck mid-upload: swallow a bounded
+            amount of the unread body first, otherwise the client sees a reset instead of our message."""
+            try:
+                left = min(int(self.headers.get('Content-Length', 0)), 4 << 20)
+                while left > 0:
+                    b = self.rfile.read(min(65536, left))
+                    if not b:
+                        break
+                    left -= len(b)
+            except (ValueError, OSError):
+                pass
+            self._send(code, text, 'text/plain')
+
+        def _upload(self, url):
+            """Browser drag-and-drop: the body is one file, sent to the computer named in ?to=."""
+            to = urllib.parse.parse_qs(url.query).get('to', [''])[0]
+            name = urllib.parse.unquote(self.headers.get('X-Filename', ''))
+            try:
+                size = int(self.headers.get('Content-Length', -1))
+            except ValueError:
+                size = -1
+            if not srv.files:
+                return self._reject(403, 'file transfer is switched off')
+            if not name or not 0 <= size <= kvm.MAX_FILE:
+                return self._reject(400, 'bad file')
+            targets, err = srv.resolve_targets(to, kvm.SERVER)
+            if err:
+                return self._reject(400, err)
+            path, got = srv.spool_file(), 0
+            try:
+                with open(path, 'wb') as out:
+                    while got < size:
+                        b = self.rfile.read(min(kvm.CHUNK, size - got))
+                        if not b:
+                            raise ConnectionError('upload was cut short')
+                        out.write(b)
+                        got += len(b)
+                res = srv.deliver(path, name, size, targets, kvm.SERVER)
+            except (OSError, ConnectionError) as e:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return self._send(500, str(e), 'text/plain')
+            self._send(200, json.dumps(res))
+
         def do_POST(self):
             if not self._local_host() or self.headers.get('X-KVM') != '1':
-                return self._send(403, 'forbidden', 'text/plain')
+                return self._reject(403, 'forbidden')
+            url = urllib.parse.urlsplit(self.path)
+            if url.path == '/api/send':
+                return self._upload(url)
             if self.path != '/api/layout':
                 return self._send(404, 'not found', 'text/plain')
             try:

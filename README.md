@@ -50,6 +50,11 @@ instantly and are saved. Use `--no-browser` to skip auto-opening it.
 
 - **Ctrl+Alt+Shift+1..9** jumps straight to a computer (the number is shown on its box).
 - **Ctrl+Alt+Shift+0** always returns control to the server. This is your escape hatch.
+- **Files:** send a file to any other computer. From the server, drag it onto that computer's
+  box in the layout editor. From any computer, run `python send.py report.pdf` (to the server), or
+  `python send.py report.pdf --to NAME` / `--to all`. Files arrive in the receiver's
+  **Downloads > KVM Received** folder and never overwrite anything. One file at a time (zip a
+  folder first), up to 8 GB each. Opt out of sending/receiving with `--no-files`.
 - Up to 64 clients. Edge-crossing works for all of them, on any side, including client to
   client; the hotkeys cover the first nine.
 - **Clipboard:** copied *text* is shared between all connected computers automatically
@@ -68,8 +73,8 @@ instantly and are saved. Use `--no-browser` to skip auto-opening it.
 
 ## Options
 
-`server.py`: `--reset` (new passphrase, forget the layout), `--port`, `--no-browser`, `--no-clipboard`, `--debug`.
-`client.py`: `--name NAME` (default: hostname), `--invert-scroll`, `--port`, `--no-clipboard`, `--debug`.
+`server.py`: `--reset` (new passphrase, forget the layout), `--port`, `--no-browser`, `--no-clipboard`, `--no-files`, `--debug`.
+`client.py`: `--name NAME` (default: hostname), `--invert-scroll`, `--port`, `--no-clipboard`, `--no-files`, `--debug`.
 Pairing needs UDP port 24803 reachable on the server (discovery) as well as TCP 24801.
 Settings live in `~/.kvm_share.json` (readable only by you on macOS/Linux).
 
@@ -87,7 +92,15 @@ Advanced/manual mode without the editor: `python kvm.py server --secret S --clie
 3. **See the traffic.** Run both sides with `--debug` (`python server.py --debug`,
    `python client.py --debug`). The server logs where the pointer is near edges and what it
    forwards; the client logs what it receives. Include both outputs in a bug report.
-4. A line starting `WARNING: Windows refused injected input` means Windows blocked the
+4. **Works in some windows but not others (for example cmd, PowerShell or an editor)?** Those
+   windows are almost certainly running **as administrator**. Windows blocks input from a normal
+   program into an elevated window and reports no error, so the mouse/keyboard seem dead there
+   (the cursor may still move). The client now prints a `WARNING: the active window ... runs as
+   administrator` line when that happens. Fix: start `python client.py` from a Command Prompt opened
+   with **Run as administrator**, which can control elevated windows too (not the UAC secure desktop),
+   or open that app without administrator rights. If your company doesn't allow admin prompts,
+   use the touchpad or the hotkey **Ctrl+Alt+Shift+0** to hand control back while you work in it.
+5. A line starting `WARNING: Windows refused injected input` means Windows blocked the
    injection (error 5 = access denied): use a normal, non-admin Command Prompt and check
    security software.
 
@@ -95,9 +108,9 @@ Advanced/manual mode without the editor: `python kvm.py server --secret S --clie
 
 - Keys map by physical US-keyboard position; the Windows key acts as Command and Alt as
   Option. The characters typed follow the *receiving* machine's keyboard layout.
-- Only each machine's primary display is used. Text clipboard only: no images, no file transfer.
+- Only each machine's primary display is used. Clipboard is text only (files go through `send.py` or the editor, not copy/paste).
 - Windows cannot capture or control elevated (administrator) windows or the UAC prompt.
-- **Traffic is authenticated (HMAC-SHA256) but not encrypted.** Keystrokes and clipboard text, including
+- **Traffic is authenticated (HMAC-SHA256) but not encrypted.** Keystrokes, clipboard text and files, including
   passwords, cross the network readable. Without the passphrase nobody can connect or inject
   input, but use this only on a network you trust. The passphrase is stored in plain text in
   the settings file.

@@ -61,6 +61,7 @@ def main():
     p.add_argument('--port', type=int, help='server port (default: found automatically, else %d)' % kvm.DEFAULT_PORT)
     p.add_argument('--debug', action='store_true')
     p.add_argument('--no-clipboard', action='store_true', help='do not share the text clipboard')
+    p.add_argument('--no-files', action='store_true', help='do not receive files')
     a = p.parse_args()
     kvm.DEBUG = a.debug
 
@@ -88,7 +89,7 @@ def main():
     print('\nConnecting to %s as "%s" - it keeps retrying until the server is up. Ctrl+C to stop.\n'
           % (s['host'], s['name']))
     kvm.run_client(s['host'], a.port or s.get('port') or kvm.DEFAULT_PORT, s['name'], s['secret'], s['invert'],
-                   clipboard=not a.no_clipboard, on_lost=relocate)
+                   clipboard=not a.no_clipboard, on_lost=relocate, files=not a.no_files)
 
 
 if __name__ == '__main__':

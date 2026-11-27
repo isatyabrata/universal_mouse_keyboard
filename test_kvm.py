@@ -658,6 +658,152 @@ class PairingTests(unittest.TestCase):
             srv.running = False
 
 
+class FileTransferTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, self.tmp, True)
+
+    def _rig(self, n=2, **kw):
+        srv = kvm.Server(FakeServerBackend(), kvm.Layout(), 0, kvm.derive_key('pw'), auto=True, **kw)
+        srv.inbox = os.path.join(self.tmp, 'server')
+        srv.start()
+        clients = []
+        for i in range(n):
+            cli, _ = _join(srv, 'c%d' % i)
+            cli.inbox = os.path.join(self.tmp, 'c%d' % i)
+            clients.append(cli)
+        for i in range(n):
+            self.assertTrue(wait_for(lambda i=i: 'c%d' % i in srv.ctl.peers))
+        self.addCleanup(setattr, srv, 'running', False)
+        return srv, clients
+
+    def _file(self, name='data.bin', size=3_500_000):
+        p = os.path.join(self.tmp, 'src_' + name)
+        with open(p, 'wb') as f:
+            f.write(os.urandom(size))
+        return p
+
+    def _send(self, srv, sender, paths, to, secret='pw'):
+        return kvm.send_files('127.0.0.1', srv.port, kvm.derive_key(secret), sender, paths, to)
+
+    def _got(self, folder, name):
+        p = os.path.join(self.tmp, folder, name)
+        return p if wait_for(lambda: os.path.exists(p) and not os.path.exists(p + '.part'), 5) else None
+
+    def _same(self, a, b):
+        import hashlib
+        h = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
+        return wait_for(lambda: os.path.getsize(b) == os.path.getsize(a) and h(a) == h(b), 5)
+
+    def test_client_to_server(self):
+        srv, _ = self._rig(1)
+        src = self._file()                                      # several chunks
+        res = self._send(srv, 'c0', [src], ['server'])
+        self.assertEqual(res[0][1]['delivered'], ['server'])
+        got = self._got('server', os.path.basename(src))
+        self.assertTrue(got and self._same(src, got))
+
+    def test_server_to_client_and_empty_file(self):
+        srv, _ = self._rig(1)
+        empty = self._file('empty.txt', 0)
+        big = self._file('big.bin', 700_000)
+        self._send(srv, 'server', [empty, big], ['c0'])
+        self.assertTrue(self._got('c0', 'src_empty.txt') and os.path.getsize(self._got('c0', 'src_empty.txt')) == 0)
+        self.assertTrue(self._same(big, self._got('c0', 'src_big.bin')))
+        self.assertTrue(wait_for(lambda: not srv.transfers))      # spool cleaned up after delivery
+
+    def test_client_to_other_client_and_all(self):
+        srv, _ = self._rig(2)
+        a = self._file('a.bin', 300_000)
+        self._send(srv, 'c0', [a], ['c1'])
+        self.assertTrue(self._same(a, self._got('c1', 'src_a.bin')))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'c0', 'src_a.bin')))
+        b = self._file('b.bin', 1000)
+        res = self._send(srv, 'c0', [b], ['all'])                  # everyone but the sender
+        self.assertEqual(sorted(res[0][1]['delivered']), ['c1', 'server'])
+        self.assertTrue(self._same(b, self._got('c1', 'src_b.bin')))
+        self.assertTrue(self._same(b, self._got('server', 'src_b.bin')))
+
+    def test_same_name_is_never_overwritten(self):
+        srv, _ = self._rig(1)
+        a = self._file('same.txt', 10)
+        self._send(srv, 'c0', [a], ['server'])
+        self._send(srv, 'c0', [a], ['server'])
+        self.assertTrue(self._got('server', 'src_same.txt') and self._got('server', 'src_same (1).txt'))
+
+    def test_bad_names_become_safe(self):
+        self.assertEqual(kvm.safe_name('../../etc/passwd'), 'passwd')
+        self.assertEqual(kvm.safe_name('C:\\Windows\\evil.exe'), 'evil.exe')
+        self.assertEqual(kvm.safe_name('a<b>:c?.txt'), 'a_b__c_.txt')
+        self.assertEqual(kvm.safe_name('con.txt'), '_con.txt')
+        self.assertEqual(kvm.safe_name('   '), 'file')
+        self.assertEqual(kvm.safe_name('x' * 300 + '.pdf')[-4:], '.pdf')
+        self.assertLessEqual(len(kvm.safe_name('x' * 300 + '.pdf')), 150)
+
+    def test_unknown_target_and_wrong_secret_and_disabled(self):
+        srv, _ = self._rig(1)
+        f = self._file('t.bin', 10)
+        with self.assertRaises(ConnectionError) as cm:
+            self._send(srv, 'c0', [f], ['ghost'])
+        self.assertIn('not connected', str(cm.exception))
+        with self.assertRaises(ConnectionError):
+            self._send(srv, 'c0', [f], ['server'], secret='wrong')
+        with self.assertRaises(ConnectionError) as cm:
+            kvm.send_files('127.0.0.1', srv.port, kvm.derive_key('pw'), 'c0', [self.tmp], ['server'])
+        self.assertIn('not a file', str(cm.exception))
+        off, _ = self._rig(1, files=False)
+        with self.assertRaises(ConnectionError) as cm:
+            self._send(off, 'c0', [f], ['server'])
+        self.assertIn('switched off', str(cm.exception))
+
+    def test_cut_off_upload_delivers_nothing(self):
+        srv, _ = self._rig(1)
+        s, wire = kvm.open_session('127.0.0.1', srv.port, 'c0', kvm.derive_key('pw'), purpose='xfer')
+        wire.send({'t': 'push', 'name': 'half.bin', 'size': 5_000_000, 'to': ['server']})
+        self.assertEqual(wire.recv()['t'], 'ok')
+        wire.send({'t': 'data', 'd': 'AAAA'})
+        kvm._hangup(s)                                             # hangs up mid-file
+        time.sleep(0.5)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'server', 'half.bin')))
+        self.assertTrue(srv._spool is None or not os.listdir(srv._spool))
+
+    def test_a_computer_cannot_pull_someone_elses_file(self):
+        srv, _ = self._rig(2)
+        srv.transfers['abc'] = {'path': self._file('x.bin', 5), 'name': 'x.bin', 'size': 5, 't': time.time(),
+                                'pending': {'c0'}}
+        s, wire = kvm.open_session('127.0.0.1', srv.port, 'c1', kvm.derive_key('pw'), purpose='xfer')
+        wire.send({'t': 'pull', 'id': 'abc'})
+        self.assertEqual(wire.recv()['t'], 'error')
+        kvm._hangup(s)
+
+    def test_editor_drag_and_drop_upload(self):
+        import urllib.error
+        import urllib.request
+        import layout_ui
+        srv, _ = self._rig(1)
+        s = socket.socket()
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+        s.close()
+        base = layout_ui.start(srv, port)
+        data = os.urandom(400_000)
+
+        def post(query, headers):
+            req = urllib.request.Request(base + '/api/send?to=' + query, data=data, headers=headers)
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        hdr = {'X-KVM': '1', 'X-Filename': 'dropped%20file.bin'}
+        self.assertEqual(post('c0', {'X-Filename': 'x'}), 403)               # no X-KVM header
+        self.assertEqual(post('ghost', hdr), 400)
+        self.assertEqual(post('c0', hdr), 200)
+        got = self._got('c0', 'dropped file.bin')
+        self.assertTrue(got and open(got, 'rb').read() == data)
+
+
 class MacClipboardTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS only')
     def test_pbcopy_roundtrip(self):
@@ -678,6 +824,8 @@ class MacCursorTests(unittest.TestCase):
         """Regression: hiding from a non-main thread silently did nothing. freeze() must be
         queued to the main thread (which run_server drives through pump())."""
         be = kvm.MacBackend()
+        if not be.cg.CGCursorIsVisible():
+            self.skipTest('another program (e.g. a running server.py) has the cursor hidden right now')
         be.pumping = True
         res = {}
 

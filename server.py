@@ -24,6 +24,7 @@ def main():
     p.add_argument('--no-browser', action='store_true', help='do not open the layout editor automatically')
     p.add_argument('--debug', action='store_true')
     p.add_argument('--no-clipboard', action='store_true', help='do not share the text clipboard')
+    p.add_argument('--no-files', action='store_true', help='do not send or receive files')
     a = p.parse_args()
     kvm.DEBUG = a.debug
 
@@ -57,7 +58,7 @@ def main():
     print('connects - drag the boxes to match your desk. Ctrl+Alt+Shift+1..9 jumps to')
     print('a computer; Ctrl+Alt+Shift+0 always returns here.\n')
     kvm.run_server(layout, a.port, s['secret'], auto=True, on_change=save, on_ready=ready,
-                   clipboard=not a.no_clipboard, pairing=True)
+                   clipboard=not a.no_clipboard, pairing=True, files=not a.no_files)
 
 
 if __name__ == '__main__':

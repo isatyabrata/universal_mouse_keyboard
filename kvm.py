@@ -6,15 +6,20 @@ Run `python kvm.py server ...` on the machine the keyboard/mouse is plugged into
 and `python kvm.py client ...` on every other machine. See README.md.
 """
 import argparse
+import atexit
+import base64
 import hashlib
 import hmac
 import json
 import os
 import queue
 import re
+import secrets
+import shutil
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -555,6 +560,151 @@ def terminal_approver(name, ip, code, timeout=PAIR_TIMEOUT):
     return line.strip().lower() in ('y', 'yes')
 
 
+# ------------------------------------------------------------------ file transfer
+# Each file travels over its own short-lived connection (same handshake and per-frame MAC as the
+# control channel, marked purpose='xfer'), so a big file never delays mouse or keyboard events.
+# sender -> server (spooled on disk) -> every receiving computer pulls it into its inbox folder.
+# Like everything else here the data is authenticated but not encrypted.
+CHUNK = 192 * 1024
+MAX_FILE = 8 * 1024 ** 3
+SPOOL_TTL = 3600
+INBOX_DIR = None            # override (tests); default is ~/Downloads/KVM Received
+_RESERVED = {'CON', 'PRN', 'AUX', 'NUL'} | {'COM%d' % i for i in range(1, 10)} | {'LPT%d' % i for i in range(1, 10)}
+
+
+def inbox_dir(d=None):
+    d = d or INBOX_DIR
+    if not d:
+        home = os.path.expanduser('~')
+        base = os.path.join(home, 'Downloads')
+        d = os.path.join(base if os.path.isdir(base) else home, 'KVM Received')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def safe_name(name):
+    """A bare file name that is safe on Windows and macOS: no folders, no reserved characters."""
+    name = os.path.basename(str(name).replace('\\', '/'))
+    name = ''.join('_' if (ord(c) < 32 or c in '<>:"/\\|?*') else c for c in name).strip(' .')
+    stem, ext = os.path.splitext(name)
+    if not stem or stem.upper() in _RESERVED:
+        name = '_' + name if name else 'file'
+        stem, ext = os.path.splitext(name)
+    return stem[:150 - len(ext)] + ext if len(name) > 150 else name
+
+
+def create_unique(folder, name):
+    """Create `name` in `folder` without overwriting anything; returns (path, open file)."""
+    stem, ext = os.path.splitext(name)
+    for i in range(0, 1000):
+        path = os.path.join(folder, name if i == 0 else '%s (%d)%s' % (stem, i, ext))
+        try:
+            return path, open(path, 'xb')
+        except FileExistsError:
+            continue
+    raise OSError('too many files called %s' % name)
+
+
+def human(n):
+    for unit in ('bytes', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return '%d %s' % (n, unit) if unit == 'bytes' else '%.1f %s' % (n, unit)
+        n /= 1024.0
+
+
+def _send_file(wire, f, size, progress=None):
+    sent = 0
+    while sent < size:
+        b = f.read(min(CHUNK, size - sent))
+        if not b:
+            raise ConnectionError('the file changed while it was being sent')
+        wire.send({'t': 'data', 'd': base64.b64encode(b).decode()})
+        sent += len(b)
+        if progress:
+            progress(sent)
+    wire.send({'t': 'end'})
+
+
+def _recv_file(wire, out, size, progress=None):
+    got = 0
+    while True:
+        m = wire.recv()
+        if m.get('t') == 'end':
+            break
+        if m.get('t') != 'data':
+            raise ConnectionError(m.get('msg') or 'unexpected message during file transfer')
+        b = base64.b64decode(m['d'])
+        got += len(b)
+        if got > size:
+            raise ConnectionError('more data than announced')
+        out.write(b)
+        if progress:
+            progress(got)
+    if got != size:
+        raise ConnectionError('the file was cut short (%d of %d bytes)' % (got, size))
+
+
+def _hangup(s):
+    """Really end the connection (a makefile() reader would otherwise keep the socket open)."""
+    try:
+        s.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    s.close()
+
+
+def open_session(host, port, name, key, size=(0, 0), purpose='', timeout=5):
+    """Connect and authenticate. Returns (socket, wire). purpose='' is the control channel."""
+    s = socket.create_connection((host, port), timeout=timeout)
+    try:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        wire = Wire(s, False)
+        ch = wire.recv()
+        if ch.get('t') != 'challenge':
+            raise ConnectionError('unexpected reply from server')
+        s_nonce = bytes.fromhex(ch['n'])
+        c_nonce = os.urandom(16)
+        wire.send({'t': 'hello', 'name': name, 'w': size[0], 'h': size[1], 'n': c_nonce.hex(),
+                   'purpose': purpose,
+                   'proof': _hm(key, b'client', s_nonce, c_nonce, name.encode(), purpose.encode()).hex()})
+        wm = wire.recv()
+        if wm.get('t') == 'error':
+            raise ConnectionError('server refused: %s' % wm.get('msg'))
+        if not hmac.compare_digest(bytes.fromhex(wm['proof']), _hm(key, b'server', s_nonce, c_nonce)):
+            raise ConnectionError('server failed authentication')
+        wire.key = _hm(key, b'session', s_nonce, c_nonce)
+        return s, wire
+    except BaseException:
+        _hangup(s)
+        raise
+
+
+def send_files(host, port, key, name, paths, to, progress=None):
+    """Send local files to computers named in `to` ('server', 'all', or client names).
+    Returns [(path, {'delivered': [...]}), ...]; raises ConnectionError with the server's reason."""
+    out = []
+    for p in paths:
+        if not os.path.isfile(p):
+            raise ConnectionError('%s is not a file (folders are not supported - zip it first)' % p)
+        size = os.path.getsize(p)
+        s, wire = open_session(host, port, name, key, purpose='xfer')
+        try:
+            s.settimeout(120)
+            wire.send({'t': 'push', 'name': os.path.basename(p), 'size': size, 'to': to})
+            r = wire.recv()
+            if r.get('t') == 'error':
+                raise ConnectionError(r.get('msg'))
+            with open(p, 'rb') as f:
+                _send_file(wire, f, size, (lambda n, p=p: progress(p, n, size)) if progress else None)
+            r = wire.recv()
+            if r.get('t') == 'error':
+                raise ConnectionError(r.get('msg'))
+            out.append((p, r))
+        finally:
+            _hangup(s)
+    return out
+
+
 MAX_CLIP = 100000     # characters of text shared per copy
 CLIP_POLL = 0.4       # seconds between clipboard checks
 
@@ -663,7 +813,7 @@ class Peer:
 
 class Server:
     def __init__(self, backend, layout, port, key, auto=False, on_change=None, clipboard=True,
-                 secret=None, approver=None, discovery_port=None):
+                 secret=None, approver=None, discovery_port=None, files=True):
         """auto=True lets any client that knows the secret join; it is added to the layout
         in the next free cell. on_change() is called whenever the layout changes."""
         self.ctl = Controller(backend, layout)
@@ -674,6 +824,11 @@ class Server:
         self.clip = None
         self.clipboard = clipboard
         self.secret, self.approver = secret, approver      # for one-time pairing
+        self.files = files
+        self.inbox = None                   # where files sent to the server are saved
+        self.transfers = {}                 # id -> spooled file waiting for receivers to pull it
+        self.tlock = threading.Lock()
+        self._spool = None
         self._pairing = threading.Lock()
         self.disc = None
         if discovery_port is not None:
@@ -701,6 +856,7 @@ class Server:
         threading.Thread(target=self._accept_loop, daemon=True).start()
         if self.disc:
             threading.Thread(target=self._discovery_loop, daemon=True).start()
+        threading.Thread(target=self._sweep_loop, daemon=True).start()
 
     def _discovery_loop(self):
         reply = json.dumps({'t': 'kvm-here', 'port': self.port, 'name': socket.gethostname()}).encode()
@@ -716,6 +872,110 @@ class Server:
                     self.disc.sendto(reply, addr)
             except (ValueError, AttributeError, OSError):
                 pass
+
+    # -- file transfer
+    def spool_file(self):
+        if self._spool is None:
+            self._spool = tempfile.mkdtemp(prefix='kvm_spool_')
+            atexit.register(shutil.rmtree, self._spool, True)
+        return os.path.join(self._spool, secrets.token_hex(8))
+
+    def _sweep_loop(self):
+        while self.running:
+            time.sleep(30)
+            cutoff = time.time() - SPOOL_TTL
+            with self.tlock:
+                for tid in [t for t, r in self.transfers.items() if r['t'] < cutoff]:
+                    self._drop(tid)
+
+    def _drop(self, tid):                      # caller holds tlock
+        rec = self.transfers.pop(tid, None)
+        if rec:
+            try:
+                os.remove(rec['path'])
+            except OSError:
+                pass
+
+    def resolve_targets(self, to, sender):
+        """-> (list of target names, None) or (None, error text). Targets: 'server', client names, 'all'."""
+        to = [to] if isinstance(to, str) else list(to or [])
+        names = []
+        for t in to:
+            names += [SERVER] + list(self.ctl.peers) if t == 'all' else [t]
+        names = [n for i, n in enumerate(names) if n != sender and n not in names[:i]]
+        if not names:
+            return None, 'nobody to send to'
+        bad = [n for n in names if n != SERVER and n not in self.ctl.peers]
+        if bad:
+            return None, 'not connected: ' + ', '.join(str(b) for b in bad)
+        return names, None
+
+    def deliver(self, path, name, size, targets, sender):
+        """The file is complete in the spool at `path`; put it where it is going."""
+        clients = [t for t in targets if t != SERVER]
+        saved = None
+        if SERVER in targets:
+            saved, f = create_unique(inbox_dir(self.inbox), safe_name(name))
+            f.close()
+            if clients:
+                shutil.copyfile(path, saved)
+            else:
+                shutil.move(path, saved)
+            log('received file from %s: %s (%s)' % (sender, saved, human(size)))
+        if clients:
+            tid = secrets.token_hex(8)
+            with self.tlock:
+                self.transfers[tid] = {'path': path, 'name': name, 'size': size, 't': time.time(),
+                                       'pending': set(clients)}
+            for c in clients:
+                self.ctl.peers[c].put({'t': 'file', 'id': tid, 'name': name, 'size': size})
+            log('sending %s (%s) from %s to %s' % (name, human(size), sender, ', '.join(clients)))
+        elif saved is None:
+            os.remove(path)
+        return {'delivered': targets, 'saved_as': saved}
+
+    def _xfer(self, wire, sender):
+        if not self.files:
+            wire.send({'t': 'error', 'msg': 'file transfer is switched off on the server'})
+            return
+        req = wire.recv()
+        if req.get('t') == 'push':
+            name, size = safe_name(req.get('name')), int(req.get('size', -1))
+            if not 0 <= size <= MAX_FILE:
+                return wire.send({'t': 'error', 'msg': 'bad file size'})
+            targets, err = self.resolve_targets(req.get('to'), sender)
+            if err:
+                return wire.send({'t': 'error', 'msg': err})
+            wire.send({'t': 'ok'})
+            path = self.spool_file()
+            try:
+                with open(path, 'wb') as out:
+                    _recv_file(wire, out, size)
+            except BaseException:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                raise
+            wire.send(dict(self.deliver(path, name, size, targets, sender), t='done'))
+        elif req.get('t') == 'pull':
+            tid = req.get('id')
+            with self.tlock:
+                rec = self.transfers.get(tid)
+                if not rec or sender not in rec['pending']:
+                    rec = None
+            if not rec:
+                return wire.send({'t': 'error', 'msg': 'no such transfer'})
+            wire.send({'t': 'file', 'name': rec['name'], 'size': rec['size']})
+            with open(rec['path'], 'rb') as f:
+                _send_file(wire, f, rec['size'])
+            if wire.recv().get('t') == 'ack':
+                with self.tlock:
+                    rec['pending'].discard(sender)
+                    if not rec['pending']:
+                        self._drop(tid)
+        else:
+            wire.send({'t': 'error', 'msg': 'unknown request'})
 
     def _pair(self, wire, m, addr):
         if not (self.approver and self.secret):
@@ -800,15 +1060,19 @@ class Server:
                 return self._pair(wire, m, addr)
             name = str(m['name'])
             c_nonce = bytes.fromhex(m['n'])
-            want = _hm(self.key, b'client', s_nonce, c_nonce, name.encode())
+            purpose = str(m.get('purpose', ''))
+            want = _hm(self.key, b'client', s_nonce, c_nonce, name.encode(), purpose.encode())
             if m.get('t') != 'hello' or not hmac.compare_digest(bytes.fromhex(m['proof']), want):
                 wire.send({'t': 'error', 'msg': 'authentication failed'})
                 raise ConnectionError('authentication failed (wrong secret?)')
-            if not self._known(name) and not self._enroll(name):
+            if purpose != 'xfer' and not self._known(name) and not self._enroll(name):
                 wire.send({'t': 'error', 'msg': 'unknown client name'})
                 raise ConnectionError('unknown client name %r' % name)
             wire.send({'t': 'welcome', 'proof': _hm(self.key, b'server', s_nonce, c_nonce).hex()})
             wire.key = _hm(self.key, b'session', s_nonce, c_nonce)
+            if purpose == 'xfer':
+                c.settimeout(120)
+                return self._xfer(wire, name)
             c.settimeout(None)
             peer = Peer(name, wire, int(m['w']), int(m['h']))
             old = self.ctl.peers.get(name)
@@ -836,7 +1100,9 @@ class Server:
 # ----------------------------------------------------------------------- client
 class Client:
     def __init__(self, backend, host, port, name, key, invert_scroll=False, clipboard=True,
-                 on_lost=None):
+                 on_lost=None, files=True):
+        self.files = files
+        self.inbox = None                   # where received files are saved (default: Downloads)
         self.on_lost = on_lost          # called after repeated failures; may return a new (host, port)
         self.connected = False
         self.be, self.host, self.port, self.name, self.key = backend, host, port, name, key
@@ -878,25 +1144,8 @@ class Client:
             time.sleep(RETRY_DELAY)
 
     def session(self):
-        s = socket.create_connection((self.host, self.port), timeout=5)
+        s, wire = open_session(self.host, self.port, self.name, self.key, self.be.size())
         try:
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            wire = Wire(s, False)
-            ch = wire.recv()
-            if ch.get('t') != 'challenge':
-                raise ConnectionError('unexpected reply from server')
-            s_nonce = bytes.fromhex(ch['n'])
-            c_nonce = os.urandom(16)
-            w, h = self.be.size()
-            wire.send({'t': 'hello', 'name': self.name, 'w': w, 'h': h, 'n': c_nonce.hex(),
-                       'proof': _hm(self.key, b'client', s_nonce, c_nonce, self.name.encode()).hex()})
-            wm = wire.recv()
-            if wm.get('t') == 'error':
-                raise ConnectionError('server refused: %s' % wm.get('msg'))
-            if not hmac.compare_digest(bytes.fromhex(wm['proof']),
-                                       _hm(self.key, b'server', s_nonce, c_nonce)):
-                raise ConnectionError('server failed authentication')
-            wire.key = _hm(self.key, b'session', s_nonce, c_nonce)
             s.settimeout(20)         # server pings every 5 s
             log('connected to %s:%d as %s' % (self.host, self.port, self.name))
             self.got_move = False
@@ -931,6 +1180,38 @@ class Client:
             self.release_all()
         elif t == 'clip' and self.clip:
             self.clip.receive(m.get('text'))
+        elif t == 'file' and self.files:
+            threading.Thread(target=self._receive, args=(m['id'],), daemon=True).start()
+
+    def _receive(self, tid):
+        """The server has a file for us: pull it over its own connection into the inbox folder."""
+        out = path = None
+        try:
+            s, wire = open_session(self.host, self.port, self.name, self.key, purpose='xfer')
+            try:
+                s.settimeout(120)
+                wire.send({'t': 'pull', 'id': tid})
+                meta = wire.recv()
+                if meta.get('t') == 'error':
+                    raise ConnectionError(meta.get('msg'))
+                size = int(meta['size'])
+                path, out = create_unique(inbox_dir(self.inbox), safe_name(meta['name']))
+                _recv_file(wire, out, size)
+                out.close()
+                out = None
+                wire.send({'t': 'ack'})
+            finally:
+                _hangup(s)
+            log('received file: %s (%s)' % (path, human(size)))
+        except Exception as e:
+            if out:
+                out.close()
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            log('file transfer failed: %s' % e)
 
     def release_all(self):
         for k in list(self.keys):
@@ -1155,7 +1436,69 @@ class WinBackend:
         return self.u.CallNextHookEx(None, code, wparam, lparam)
 
     # ---- inject
+    def _is_elevated(self, pid):
+        """True if the process runs as administrator (or is too privileged for us to even look at)."""
+        c, wt, k, adv = self.ct, self.wt, self.k, self._adv
+        h = k.OpenProcess(0x1000, False, pid)             # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return True
+        try:
+            tok = wt.HANDLE()
+            if not adv.OpenProcessToken(h, 0x8, c.byref(tok)):      # TOKEN_QUERY
+                return False
+            try:
+                elev, size = wt.DWORD(0), wt.DWORD(0)
+                if adv.GetTokenInformation(tok, 20, c.byref(elev), c.sizeof(elev), c.byref(size)):
+                    return bool(elev.value)                  # TokenElevation
+                return False
+            finally:
+                k.CloseHandle(tok)
+        finally:
+            k.CloseHandle(h)
+
+    def _watch(self):
+        """Windows silently drops input injected into windows of a more privileged (administrator)
+        program (UIPI) - SendInput even reports success. Say so, once per program, instead of
+        leaving the mouse mysteriously dead in that window."""
+        now = time.time()
+        if now - getattr(self, '_watched', 0) < 1.0:
+            return
+        self._watched = now
+        try:
+            c, wt, u, k = self.ct, self.wt, self.u, self.k
+            if not hasattr(self, '_adv'):
+                self._adv = c.WinDLL('advapi32', use_last_error=True)
+                k.OpenProcess.argtypes, k.OpenProcess.restype = [wt.DWORD, wt.BOOL, wt.DWORD], wt.HANDLE
+                k.CloseHandle.argtypes = [wt.HANDLE]
+                self._adv.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, c.POINTER(wt.HANDLE)]
+                self._adv.GetTokenInformation.argtypes = [wt.HANDLE, c.c_int, c.c_void_p, wt.DWORD,
+                                                         c.POINTER(wt.DWORD)]
+                u.GetForegroundWindow.restype = wt.HWND
+                u.GetWindowThreadProcessId.argtypes = [wt.HWND, c.POINTER(wt.DWORD)]
+                u.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, c.c_int]
+                self._me_elevated = self._is_elevated(k.GetCurrentProcessId())
+                self._elev_warned = set()
+            if self._me_elevated:
+                return
+            fg = u.GetForegroundWindow()
+            pid = wt.DWORD(0)
+            u.GetWindowThreadProcessId(fg, c.byref(pid))
+            if fg and pid.value and pid.value not in self._elev_warned and self._is_elevated(pid.value):
+                self._elev_warned.add(pid.value)
+                title = c.create_unicode_buffer(256)
+                u.GetWindowTextW(fg, title, 256)
+                log('WARNING: the active window ("%s") runs as administrator, and Windows ignores mouse '
+                    'clicks and typing sent by a normal program into such windows (the cursor may still '
+                    'move). Fix: start this script from a Command Prompt opened with "Run as '
+                    'administrator" (if your company allows it), or run that app without administrator '
+                    'rights.' % title.value)
+        except Exception as e:
+            self._watched = float('inf')                       # never let the check break input
+            if DEBUG:
+                log('elevation check disabled: %s' % e)
+
     def _send(self, inp):
+        self._watch()
         if self.u.SendInput(1, self.ct.byref(inp), self.ct.sizeof(self.INPUT)) != 1:
             err = self.ct.get_last_error()
             if not getattr(self, '_warned', False):
@@ -1261,6 +1604,7 @@ class MacBackend:
         import atexit
         atexit.register(lambda: (cg.CGAssociateMouseAndMouseCursorPosition(1), self._hide(False)))  # never leave it frozen
         self.hidden = False
+        self.hides = 0
         self.pumping = False
         self._calls = queue.SimpleQueue()
         self.drift, self.rehid = 0, 0
@@ -1330,7 +1674,6 @@ class MacBackend:
         sees a real mouse event at the new spot, so if it stays visible we post one harmless
         move at the parking spot and try again."""
         for tries in range(1, 7):
-            self.hidden = False
             self._hide(True)
             if not self.cg.CGCursorIsVisible():
                 return tries
@@ -1365,7 +1708,9 @@ class MacBackend:
             self.warp(*self.park)                # dropping the event does not stop the cursor
 
     def _hide(self, on):
-        if on == self.hidden:
+        """Hide/show are counted by macOS, so remember exactly how many hides we issued and undo
+        every one of them (a leaked hide would leave the cursor invisible after control returns)."""
+        if on and self.hides >= 6:
             return
         cf, cg, c = self.cf, self.cg, self.c
         try:
@@ -1380,12 +1725,16 @@ class MacBackend:
                 cg.CGSSetConnectionProperty.argtypes = [c.c_int, c.c_int, c.c_void_p, c.c_void_p]
                 cg.CGSSetConnectionProperty(cid, cid, key, true)
                 cg.CGDisplayHideCursor(cg.CGMainDisplayID())
+                self.hides += 1
             else:
-                for _ in range(5):                    # hide/show are counted: undo until visible
+                extra = 0
+                while self.hides > 0 or (extra < 6 and not cg.CGCursorIsVisible()):
                     cg.CGDisplayShowCursor(cg.CGMainDisplayID())
-                    if cg.CGCursorIsVisible():
-                        break
-            self.hidden = on
+                    if self.hides > 0:
+                        self.hides -= 1
+                    else:
+                        extra += 1
+            self.hidden = self.hides > 0
         except Exception as e:           # private API: if it is missing the cursor just stays visible
             if DEBUG:
                 log('could not %s the cursor: %s' % ('hide' if on else 'show', e))
@@ -1582,6 +1931,7 @@ def main(argv=None):
         p.add_argument('--port', type=int, default=DEFAULT_PORT)
         p.add_argument('--debug', action='store_true')
         p.add_argument('--no-clipboard', action='store_true', help='do not share the text clipboard')
+        p.add_argument('--no-files', action='store_true', help='do not send or receive files')
     sp = sub.choices['server']
     sp.add_argument('--client', action='append', required=True, metavar='[EDGE:]NAME',
                     help='allowed client; EDGE is where its screen sits relative to this one. '
@@ -1598,19 +1948,21 @@ def main(argv=None):
     if not a.secret:
         sys.exit('set --secret or KVM_SECRET')
     if a.mode == 'server':
-        run_server(parse_layout(a.client), a.port, a.secret, clipboard=not a.no_clipboard)
+        run_server(parse_layout(a.client), a.port, a.secret, clipboard=not a.no_clipboard,
+                   files=not a.no_files)
     else:
-        run_client(a.server, a.port, a.name, a.secret, a.invert_scroll, not a.no_clipboard)
+        run_client(a.server, a.port, a.name, a.secret, a.invert_scroll, not a.no_clipboard,
+                   files=not a.no_files)
 
 
 def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None, clipboard=True,
-               pairing=False):
+               pairing=False, files=True):
     try:
         be = make_backend()
         srv = Server(be, layout, port, derive_key(secret), auto, on_change, clipboard,
                      secret=secret if pairing else None,
                      approver=terminal_approver if pairing else None,
-                     discovery_port=DISCOVERY_PORT if pairing else None)
+                     discovery_port=DISCOVERY_PORT if pairing else None, files=files)
         srv.start()
         log('server listening on port %d; screen %dx%d' % (srv.port, *be.size()))
         for i, n in enumerate(layout.order, 1):
@@ -1630,10 +1982,10 @@ def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None, 
         sys.exit('error: %s' % e)
 
 
-def run_client(host, port, name, secret, invert_scroll=False, clipboard=True, on_lost=None):
+def run_client(host, port, name, secret, invert_scroll=False, clipboard=True, on_lost=None, files=True):
     try:
         Client(make_backend(), host, port, name, derive_key(secret), invert_scroll, clipboard,
-               on_lost).run()
+               on_lost, files).run()
     except KeyboardInterrupt:
         pass
     except OSError as e:
