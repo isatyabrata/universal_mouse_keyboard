@@ -1,6 +1,7 @@
 """Loopback tests: real sockets + handshake + controller logic, fake input backends."""
 import os
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -10,6 +11,7 @@ from unittest import mock
 import client
 import kvm
 
+kvm.CLIP_POLL = 0.02    # poll the (fake) clipboards quickly
 kvm.SETTLE = 0          # most tests drive input instantly; one test restores the real value
 
 
@@ -28,6 +30,14 @@ class FakeServerBackend:
 
     def start_capture(self, handler):
         self.h_ = handler
+
+    clip = ''
+
+    def clip_get(self):
+        return self.clip
+
+    def clip_set(self, text):
+        self.clip = text
 
 
 class FakeClientBackend:
@@ -48,6 +58,14 @@ class FakeClientBackend:
 
     def inject_key(self, k, d):
         self.calls.append(('key', k, d))
+
+    clip = ''
+
+    def clip_get(self):
+        return self.clip
+
+    def clip_set(self, text):
+        self.clip = text
 
 
 def wait_for(cond, t=3.0):
@@ -422,6 +440,117 @@ class ConfigTests(unittest.TestCase):
     def test_client_default_name_is_valid(self):
         import re
         self.assertTrue(re.fullmatch(r'[A-Za-z0-9_-]+', client.default_name()))
+
+
+class ClipboardTests(unittest.TestCase):
+    def _rig(self, n=2, **kw):
+        sb = FakeServerBackend()
+        srv = kvm.Server(sb, kvm.Layout(), 0, kvm.derive_key('pw'), auto=True, **kw)
+        srv.start()
+        clients = [_join(srv, 'c%d' % i) for i in range(n)]
+        for i in range(n):
+            self.assertTrue(wait_for(lambda i=i: 'c%d' % i in srv.ctl.peers))
+        time.sleep(0.2)                    # let every sync loop take its baseline
+        return srv, sb, clients
+
+    def test_server_copy_reaches_every_client(self):
+        srv, sb, clients = self._rig()
+        try:
+            sb.clip = 'hello from the server \u00e9\u4e2d'
+            for _, be in clients:
+                self.assertTrue(wait_for(lambda be=be: be.clip == sb.clip))
+        finally:
+            srv.running = False
+
+    def test_client_copy_reaches_server_and_other_clients(self):
+        srv, sb, clients = self._rig()
+        try:
+            clients[0][1].clip = 'line1\nline2'
+            self.assertTrue(wait_for(lambda: sb.clip == 'line1\nline2'))
+            self.assertTrue(wait_for(lambda: clients[1][1].clip == 'line1\nline2'))
+            self.assertEqual(clients[0][1].clip, 'line1\nline2')
+        finally:
+            srv.running = False
+
+    def test_no_echo_loop(self):
+        srv, sb, clients = self._rig()
+        sets = []
+        orig = clients[1][1].clip_set
+        clients[1][1].clip_set = lambda t: (sets.append(t), orig(t))
+        try:
+            sb.clip = 'once'
+            self.assertTrue(wait_for(lambda: sets == ['once']))
+            time.sleep(0.3)
+            self.assertEqual(sets, ['once'])
+        finally:
+            srv.running = False
+
+    def test_existing_clipboard_is_not_broadcast_at_startup(self):
+        sb = FakeServerBackend()
+        sb.clip = 'private, copied before starting'
+        srv = kvm.Server(sb, kvm.Layout(), 0, kvm.derive_key('pw'), auto=True)
+        srv.start()
+        cli, be = _join(srv, 'c0')
+        try:
+            self.assertTrue(wait_for(lambda: 'c0' in srv.ctl.peers))
+            time.sleep(0.3)
+            self.assertEqual(be.clip, '')
+        finally:
+            srv.running = False
+
+    def test_too_large_is_not_shared(self):
+        srv, sb, clients = self._rig(1)
+        try:
+            sb.clip = 'x' * (kvm.MAX_CLIP + 1)
+            time.sleep(0.3)
+            self.assertEqual(clients[0][1].clip, '')
+            sb.clip = 'ok again'
+            self.assertTrue(wait_for(lambda: clients[0][1].clip == 'ok again'))
+        finally:
+            srv.running = False
+
+    def test_big_non_ascii_text_fits_in_a_frame(self):
+        srv, sb, clients = self._rig(1)
+        try:
+            sb.clip = '\U0001F600' * kvm.MAX_CLIP          # worst case: 12 bytes each once escaped
+            self.assertTrue(wait_for(lambda: clients[0][1].clip == sb.clip, 8))
+        finally:
+            srv.running = False
+
+    def test_disabled_on_server_shares_nothing(self):
+        srv, sb, clients = self._rig(1, clipboard=False)
+        try:
+            sb.clip = 'secret'
+            clients[0][1].clip = 'other'
+            time.sleep(0.3)
+            self.assertEqual(clients[0][1].clip, 'other')
+            self.assertEqual(sb.clip, 'secret')
+        finally:
+            srv.running = False
+
+    def test_unauthenticated_frame_size_limit_is_small(self):
+        s = socket.create_connection(('127.0.0.1', self._rig(0)[0].port))
+        try:
+            s.recv(4096)                                    # challenge
+            s.sendall((kvm.PRE_AUTH_FRAME + 1).to_bytes(4, 'big') + b'x' * 10)
+            s.settimeout(3)
+            self.assertEqual(s.recv(4096), b'')             # server hangs up
+        finally:
+            s.close()
+
+
+class MacClipboardTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS only')
+    def test_pbcopy_roundtrip(self):
+        be = kvm.MacBackend()
+        saved = be.clip_get()
+        try:
+            text = 'caf\u00e9 \u4e2d\u6587\nsecond line'
+            be.clip_set(text)
+            self.assertEqual(be.clip_get(), text)
+        finally:
+            if saved:
+                be.clip_set(saved)
 
 
 if __name__ == '__main__':

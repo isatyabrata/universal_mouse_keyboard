@@ -78,7 +78,8 @@ WIN_EXTENDED = {'left', 'right', 'up', 'down', 'home', 'end', 'pageup', 'pagedow
 # -------------------------------------------------------------------- protocol
 # Length-prefixed JSON frames. After the handshake every frame carries a sequence
 # number and an HMAC-SHA256 tag (authenticated, NOT encrypted - see README).
-MAX_FRAME = 1 << 16
+MAX_FRAME = 1 << 21        # authenticated frames (a clipboard can be large)
+PRE_AUTH_FRAME = 1 << 16   # handshake frames, before the peer has proved the secret
 
 
 def derive_key(secret):
@@ -116,7 +117,7 @@ class Wire:
 
     def recv(self):
         n = struct.unpack('!I', self._read(4))[0]
-        if n > MAX_FRAME:
+        if n > (MAX_FRAME if self.key else PRE_AUTH_FRAME):
             raise ConnectionError('frame too large')
         data = self._read(n)
         if self.key:
@@ -381,6 +382,63 @@ class Controller:
         return (m & {'lctrl', 'rctrl'}) and (m & {'lalt', 'ralt'}) and (m & {'lshift', 'rshift'})
 
 
+MAX_CLIP = 100000     # characters of text shared per copy
+CLIP_POLL = 0.4       # seconds between clipboard checks
+
+
+class ClipSync:
+    """Mirrors plain-text clipboard changes between machines; the latest copy wins.
+    `send(text)` is called when the local clipboard changes; `receive(text)` applies a remote one."""
+
+    def __init__(self, be, send, alive=lambda: True):
+        self.be, self.send, self.alive = be, send, alive
+        self.last = ''
+        self.lock = threading.Lock()
+        self.warned = False
+
+    def _read(self):
+        try:
+            return self.be.clip_get()
+        except Exception as e:
+            if not self.warned:
+                self.warned = True
+                log('clipboard sharing unavailable here: %s' % e)
+            return None
+
+    def start(self):
+        self.last = self._read() or ''           # what is already copied is not broadcast
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while self.alive():
+            time.sleep(CLIP_POLL)
+            t = self._read()
+            if not t:
+                continue
+            with self.lock:
+                if t == self.last:
+                    continue
+                self.last = t
+            if len(t) > MAX_CLIP:
+                log('clipboard text is over %d characters - not shared' % MAX_CLIP)
+                continue
+            self.send(t)
+
+    def receive(self, text):
+        """Apply a remote clipboard. Returns True if it was new (so it should be relayed)."""
+        if not isinstance(text, str) or not text or len(text) > MAX_CLIP:
+            return False
+        with self.lock:
+            if text == self.last:
+                return False
+            self.last = text
+        try:
+            self.be.clip_set(text)
+        except Exception as e:
+            log('could not set the clipboard: %s' % e)
+        return True
+
+
 class Peer:
     """One connected client as seen by the server; a writer thread owns the socket."""
 
@@ -431,7 +489,7 @@ class Peer:
 
 
 class Server:
-    def __init__(self, backend, layout, port, key, auto=False, on_change=None):
+    def __init__(self, backend, layout, port, key, auto=False, on_change=None, clipboard=True):
         """auto=True lets any client that knows the secret join; it is added to the layout
         in the next free cell. on_change() is called whenever the layout changes."""
         self.ctl = Controller(backend, layout)
@@ -439,6 +497,8 @@ class Server:
         self.layout = layout
         self.auto, self.on_change = auto, on_change
         self.key = key
+        self.clip = None
+        self.clipboard = clipboard
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(('0.0.0.0', port))
@@ -449,7 +509,15 @@ class Server:
 
     def start(self):
         self.be.start_capture(self.ctl)
+        if self.clipboard and hasattr(self.be, 'clip_get'):
+            self.clip = ClipSync(self.be, self._broadcast_clip, lambda: self.running)
+            self.clip.start()
         threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _broadcast_clip(self, text, skip=None):
+        for p in list(self.ctl.peers.values()):
+            if p is not skip:
+                p.put({'t': 'clip', 'text': text})
 
     def _accept_loop(self):
         while self.running:
@@ -512,7 +580,9 @@ class Server:
             for line in self.ctl.describe():
                 log('  ' + line)
             while True:
-                wire.recv()          # clients send nothing; this just detects disconnects
+                m = wire.recv()      # mostly this just detects disconnects
+                if m.get('t') == 'clip' and self.clip and self.clip.receive(m.get('text')):
+                    self._broadcast_clip(m['text'], skip=peer)     # relay to the other computers
         except (OSError, ConnectionError, ValueError, KeyError) as e:
             log('connection from %s ended: %s' % (addr[0], e))
         finally:
@@ -525,15 +595,29 @@ class Server:
 
 # ----------------------------------------------------------------------- client
 class Client:
-    def __init__(self, backend, host, port, name, key, invert_scroll=False):
+    def __init__(self, backend, host, port, name, key, invert_scroll=False, clipboard=True):
         self.be, self.host, self.port, self.name, self.key = backend, host, port, name, key
         self.invert = -1 if invert_scroll else 1
         self.keys, self.buttons = set(), set()
         self.running = True
         self.n = 0
         self.got_move = False
+        self.wire = None
+        self.clip = None
+        if clipboard and hasattr(backend, 'clip_get'):
+            self.clip = ClipSync(backend, self._send_clip, lambda: self.running)
+
+    def _send_clip(self, text):
+        wire = self.wire
+        if wire:
+            try:
+                wire.send({'t': 'clip', 'text': text})
+            except OSError:
+                pass
 
     def run(self):
+        if self.clip:
+            self.clip.start()
         while self.running:
             try:
                 self.session()
@@ -565,9 +649,11 @@ class Client:
             s.settimeout(20)         # server pings every 5 s
             log('connected to %s:%d as %s' % (self.host, self.port, self.name))
             self.got_move = False
+            self.wire = wire
             while True:
                 self.apply(wire.recv())
         finally:
+            self.wire = None
             s.close()
 
     def apply(self, m):
@@ -591,6 +677,8 @@ class Client:
             self.be.inject_key(m['k'], bool(m['d']))
         elif t == 'leave':
             self.release_all()
+        elif t == 'clip' and self.clip:
+            self.clip.receive(m.get('text'))
 
     def release_all(self):
         for k in list(self.keys):
@@ -666,6 +754,74 @@ class WinBackend:
 
     def freeze(self, on):
         pass
+
+    # ---- clipboard (plain text, CF_UNICODETEXT)
+    def _clip_init(self):
+        if getattr(self, '_clip_ready', False):
+            return
+        c, wt, u, k = self.ct, self.wt, self.u, self.k
+        vp = c.c_void_p
+        u.OpenClipboard.argtypes, u.OpenClipboard.restype = [wt.HWND], wt.BOOL
+        u.CloseClipboard.restype = wt.BOOL
+        u.EmptyClipboard.restype = wt.BOOL
+        u.GetClipboardData.argtypes, u.GetClipboardData.restype = [wt.UINT], vp
+        u.SetClipboardData.argtypes, u.SetClipboardData.restype = [wt.UINT, vp], vp
+        u.GetClipboardSequenceNumber.restype = wt.DWORD
+        k.GlobalAlloc.argtypes, k.GlobalAlloc.restype = [wt.UINT, c.c_size_t], vp
+        k.GlobalLock.argtypes, k.GlobalLock.restype = [vp], vp
+        k.GlobalUnlock.argtypes, k.GlobalUnlock.restype = [vp], wt.BOOL
+        k.GlobalFree.argtypes, k.GlobalFree.restype = [vp], vp
+        self._clip_seq = None
+        self._clip_ready = True
+
+    def _open_clip(self):
+        for _ in range(10):                       # another program may hold it for a moment
+            if self.u.OpenClipboard(None):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def clip_get(self):
+        self._clip_init()
+        seq = self.u.GetClipboardSequenceNumber()
+        if seq == self._clip_seq:
+            return None                           # unchanged since the last look
+        if not self._open_clip():
+            return None
+        try:
+            self._clip_seq = seq
+            h = self.u.GetClipboardData(13)       # CF_UNICODETEXT
+            if not h:
+                return None                       # not text (image, files, ...)
+            ptr = self.k.GlobalLock(h)
+            if not ptr:
+                return None
+            try:
+                return self.ct.wstring_at(ptr).replace('\r\n', '\n')
+            finally:
+                self.k.GlobalUnlock(h)
+        finally:
+            self.u.CloseClipboard()
+
+    def clip_set(self, text):
+        self._clip_init()
+        data = text.replace('\r\n', '\n').replace('\n', '\r\n')
+        raw = (data + '\0').encode('utf-16-le')
+        if not self._open_clip():
+            raise OSError('clipboard is busy')
+        try:
+            self.u.EmptyClipboard()
+            h = self.k.GlobalAlloc(0x0002, len(raw))   # GMEM_MOVEABLE
+            if not h:
+                raise OSError('out of memory')
+            ptr = self.k.GlobalLock(h)
+            self.ct.memmove(ptr, raw, len(raw))
+            self.k.GlobalUnlock(h)
+            if not self.u.SetClipboardData(13, h):
+                self.k.GlobalFree(h)
+                raise OSError('SetClipboardData failed (error %d)' % self.ct.get_last_error())
+        finally:
+            self.u.CloseClipboard()
 
     def cursor_pos(self):
         pt = self.wt.POINT()
@@ -902,6 +1058,20 @@ class MacBackend:
             if DEBUG:
                 log('could not %s the cursor: %s' % ('hide' if on else 'show', e))
 
+    # ---- clipboard (plain text) via the system tools every Mac has
+    @staticmethod
+    def _clip_env():
+        return dict(os.environ, LANG='en_US.UTF-8', LC_ALL='en_US.UTF-8')
+
+    def clip_get(self):
+        import subprocess
+        r = subprocess.run(['pbpaste'], capture_output=True, env=self._clip_env(), timeout=5)
+        return r.stdout.decode('utf-8', 'replace') if r.returncode == 0 else None
+
+    def clip_set(self, text):
+        import subprocess
+        subprocess.run(['pbcopy'], input=text.encode('utf-8'), env=self._clip_env(), timeout=5, check=True)
+
     def cursor_pos(self):
         ev = self.cg.CGEventCreate(None)
         p = self.cg.CGEventGetLocation(ev)
@@ -1075,6 +1245,7 @@ def main(argv=None):
                        help='shared passphrase (or set KVM_SECRET); must match on all machines')
         p.add_argument('--port', type=int, default=DEFAULT_PORT)
         p.add_argument('--debug', action='store_true')
+        p.add_argument('--no-clipboard', action='store_true', help='do not share the text clipboard')
     sp = sub.choices['server']
     sp.add_argument('--client', action='append', required=True, metavar='[EDGE:]NAME',
                     help='allowed client; EDGE is where its screen sits relative to this one. '
@@ -1091,15 +1262,15 @@ def main(argv=None):
     if not a.secret:
         sys.exit('set --secret or KVM_SECRET')
     if a.mode == 'server':
-        run_server(parse_layout(a.client), a.port, a.secret)
+        run_server(parse_layout(a.client), a.port, a.secret, clipboard=not a.no_clipboard)
     else:
-        run_client(a.server, a.port, a.name, a.secret, a.invert_scroll)
+        run_client(a.server, a.port, a.name, a.secret, a.invert_scroll, not a.no_clipboard)
 
 
-def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None):
+def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None, clipboard=True):
     try:
         be = make_backend()
-        srv = Server(be, layout, port, derive_key(secret), auto, on_change)
+        srv = Server(be, layout, port, derive_key(secret), auto, on_change, clipboard)
         srv.start()
         log('server listening on port %d; screen %dx%d' % (srv.port, *be.size()))
         for i, n in enumerate(layout.order, 1):
@@ -1118,9 +1289,9 @@ def run_server(layout, port, secret, auto=False, on_change=None, on_ready=None):
         sys.exit('error: %s' % e)
 
 
-def run_client(host, port, name, secret, invert_scroll=False):
+def run_client(host, port, name, secret, invert_scroll=False, clipboard=True):
     try:
-        Client(make_backend(), host, port, name, derive_key(secret), invert_scroll).run()
+        Client(make_backend(), host, port, name, derive_key(secret), invert_scroll, clipboard).run()
     except KeyboardInterrupt:
         pass
     except OSError as e:

@@ -26,6 +26,7 @@ def main():
     p.add_argument('--invert-scroll', action='store_true', help='flip scroll direction')
     p.add_argument('--port', type=int, default=kvm.DEFAULT_PORT)
     p.add_argument('--debug', action='store_true')
+    p.add_argument('--no-clipboard', action='store_true', help='do not share the text clipboard')
     a = p.parse_args()
     kvm.DEBUG = a.debug
 
@@ -43,7 +44,8 @@ def main():
 
     print('\nConnecting to %s as "%s" - it keeps retrying until the server is up. Ctrl+C to stop.\n'
           % (s['host'], s['name']))
-    kvm.run_client(s['host'], a.port, s['name'], s['secret'], s['invert'])
+    kvm.run_client(s['host'], a.port, s['name'], s['secret'], s['invert'],
+                   clipboard=not a.no_clipboard)
 
 
 if __name__ == '__main__':

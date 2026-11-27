@@ -48,6 +48,10 @@ instantly and are saved. Use `--no-browser` to skip auto-opening it.
 - **Ctrl+Alt+Shift+1..9** jumps straight to a computer (the number is shown on its box).
 - **Ctrl+Alt+Shift+0** always returns control to the server. This is your escape hatch.
 - Up to 9 clients.
+- **Clipboard:** copied *text* is shared between all connected computers automatically
+  (the latest copy wins, up to 100,000 characters). Copy on one, paste on another. Use
+  `--no-clipboard` on a machine to opt out of sending and receiving. Images and files are
+  not shared.
 
 ## One-time setup per OS
 
@@ -60,8 +64,8 @@ instantly and are saved. Use `--no-browser` to skip auto-opening it.
 
 ## Options
 
-`server.py`: `--reset` (new passphrase, forget the layout), `--port`, `--no-browser`, `--debug`.
-`client.py`: `--name NAME` (default: hostname), `--invert-scroll`, `--port`, `--debug`.
+`server.py`: `--reset` (new passphrase, forget the layout), `--port`, `--no-browser`, `--no-clipboard`, `--debug`.
+`client.py`: `--name NAME` (default: hostname), `--invert-scroll`, `--port`, `--no-clipboard`, `--debug`.
 Settings live in `~/.kvm_share.json` (readable only by you on macOS/Linux).
 
 Advanced/manual mode without the editor: `python kvm.py server --secret S --client right:laptop
@@ -86,9 +90,9 @@ Advanced/manual mode without the editor: `python kvm.py server --secret S --clie
 
 - Keys map by physical US-keyboard position; the Windows key acts as Command and Alt as
   Option. The characters typed follow the *receiving* machine's keyboard layout.
-- Only each machine's primary display is used. **No clipboard or file transfer yet**: copy/paste between computers does not work.
+- Only each machine's primary display is used. Text clipboard only: no images, no file transfer.
 - Windows cannot capture or control elevated (administrator) windows or the UAC prompt.
-- **Traffic is authenticated (HMAC-SHA256) but not encrypted.** Keystrokes, including
+- **Traffic is authenticated (HMAC-SHA256) but not encrypted.** Keystrokes and clipboard text, including
   passwords, cross the network readable. Without the passphrase nobody can connect or inject
   input, but use this only on a network you trust. The passphrase is stored in plain text in
   the settings file.
